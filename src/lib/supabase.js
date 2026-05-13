@@ -7,6 +7,10 @@ import { createClient } from '@supabase/supabase-js';
 const url  = import.meta.env.VITE_SUPABASE_URL;
 const key  = import.meta.env.VITE_SUPABASE_ANON_KEY;
 
+if (!url || !key) {
+  console.warn('[Ticker] Supabase env vars missing. Sync will be disabled.');
+}
+
 export const supabase = (url && key) ? createClient(url, key) : null;
 
 // We use a single anonymous "user identity" stored in localStorage so you don't
@@ -21,6 +25,7 @@ export function getIdentity() {
   if (!id) {
     id = crypto.randomUUID();
     localStorage.setItem(IDENTITY_KEY, id);
+    console.log('[Ticker] New identity created:', id);
   }
   return id;
 }
@@ -31,15 +36,27 @@ export function setIdentity(id) {
 
 // ---- State persistence: we store the whole state as one JSON blob keyed by identity ----
 export async function loadState() {
-  if (!supabase) return null;
+  if (!supabase) {
+    console.log('[Ticker] loadState: supabase client not configured');
+    return null;
+  }
   const identity = getIdentity();
+  console.log('[Ticker] loadState: looking up identity', identity);
   const { data, error } = await supabase
     .from('ticker_state')
     .select('state')
     .eq('identity', identity)
     .maybeSingle();
-  if (error) { console.warn('loadState error', error); return null; }
-  return data?.state || null;
+  if (error) {
+    console.error('[Ticker] loadState ERROR:', error);
+    return null;
+  }
+  if (!data) {
+    console.log('[Ticker] loadState: no row for this identity yet (first time on this device)');
+    return null;
+  }
+  console.log('[Ticker] loadState: loaded state with', Object.keys(data.state || {}).length, 'keys');
+  return data.state;
 }
 
 let saveTimer = null;
@@ -49,9 +66,15 @@ export function saveState(state) {
   clearTimeout(saveTimer);
   saveTimer = setTimeout(async () => {
     const identity = getIdentity();
-    const { error } = await supabase
+    console.log('[Ticker] saveState: writing for identity', identity);
+    const { data, error } = await supabase
       .from('ticker_state')
-      .upsert({ identity, state, updated_at: new Date().toISOString() });
-    if (error) console.warn('saveState error', error);
+      .upsert({ identity, state, updated_at: new Date().toISOString() })
+      .select();
+    if (error) {
+      console.error('[Ticker] saveState ERROR:', error);
+    } else {
+      console.log('[Ticker] saveState OK:', data);
+    }
   }, 800);
 }
