@@ -27,13 +27,25 @@ async function cached(key, ttl, fetcher) {
 async function fetchJson(path) {
   const sep = path.includes('?') ? '&' : '?';
   const res = await fetch(`${BASE}${path}${sep}token=${API_KEY}`);
-  if (!res.ok) throw new Error(`Finnhub ${res.status}`);
+  if (!res.ok) {
+    const body = await res.text().catch(() => '');
+    console.warn(`Finnhub ${res.status} for ${path}:`, body);
+    throw new Error(`Finnhub ${res.status}`);
+  }
   return res.json();
 }
 
 // Current quote: { c: current, d: change, dp: %, h: high, l: low, o: open, pc: prev close }
+// Note: if Finnhub doesn't have the symbol (e.g. typo), it returns all zeros.
 export async function getQuote(symbol) {
-  return cached(`quote:${symbol}`, CACHE_TTL.quote, () => fetchJson(`/quote?symbol=${symbol}`));
+  return cached(`quote:${symbol}`, CACHE_TTL.quote, async () => {
+    const q = await fetchJson(`/quote?symbol=${symbol}`);
+    // Sanity check — if everything is zero, the symbol doesn't exist on Finnhub
+    if (!q || (q.c === 0 && q.pc === 0)) {
+      console.warn(`No quote data for ${symbol} — may be an invalid or unsupported symbol`);
+    }
+    return q;
+  });
 }
 
 // Company profile: { name, ticker, exchange, finnhubIndustry, logo, weburl, ... }
@@ -51,10 +63,34 @@ export async function getNews(symbol, daysBack = 7) {
   );
 }
 
-// Helper: classify impact based on simple heuristics (headline keywords + recency).
-// You can refine this later with sentiment APIs.
-const HIGH_KEYWORDS = ['cut', 'guidance', 'beat', 'miss', 'lawsuit', 'investigation', 'recall', 'acquires', 'acquisition', 'merger', 'fda', 'sec', 'ceo', 'fired', 'resigns', 'bankruptcy', 'hack', 'breach', 'wins', 'awarded', 'contract', 'partnership', 'launches', 'unveils'];
-const MED_KEYWORDS = ['upgrades', 'downgrades', 'target', 'analyst', 'price target', 'reports', 'announces'];
+// ---- Tighter impact classifier ----
+// Old version flagged almost everything as "high" because "announces"/"reports" appear constantly.
+// New version: only truly market-moving keywords count as HIGH. Most news is LOW.
+
+const HIGH_KEYWORDS = [
+  // Earnings/guidance surprises
+  'beats estimates', 'misses estimates', 'beats expectations', 'misses expectations',
+  'cuts guidance', 'raises guidance', 'lowers guidance', 'slashes guidance',
+  'profit warning', 'earnings warning',
+  // Major corporate actions
+  'acquires', 'acquisition', 'merger', 'spinoff', 'spin-off',
+  'bankruptcy', 'chapter 11', 'going private',
+  // Leadership shocks
+  'ceo steps down', 'ceo resigns', 'ceo fired', 'cfo resigns', 'cfo steps down',
+  // Regulatory / legal hits
+  'sec charges', 'sec investigation', 'doj investigation', 'lawsuit', 'recall',
+  'fda approval', 'fda rejects', 'fda denies',
+  // Security incidents
+  'data breach', 'hacked', 'cyberattack',
+  // Major contracts
+  'wins contract', 'awarded contract',
+];
+
+const MED_KEYWORDS = [
+  'upgrades', 'downgrades', 'price target', 'analyst', 'initiates coverage',
+  'partnership', 'launches', 'unveils', 'expands',
+  'beats', 'misses', // looser earnings mentions
+];
 
 export function classifyImpact(headline) {
   const h = (headline || '').toLowerCase();
