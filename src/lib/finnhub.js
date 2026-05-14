@@ -11,9 +11,10 @@ if (!API_KEY) {
 // ---- Simple in-memory cache to avoid blowing through the rate limit ----
 const cache = new Map();
 const CACHE_TTL = {
-  quote: 60 * 1000,       // 1 min — prices update often
-  profile: 24 * 3600 * 1000, // 1 day — company names don't change
-  news: 5 * 60 * 1000,    // 5 min — news doesn't need to be real-time
+  quote:   60 * 1000,
+  profile: 24 * 3600 * 1000,
+  news:    5  * 60 * 1000,
+  candle:  60 * 60 * 1000,   // 1 hour — historical data doesn't change much
 };
 
 async function cached(key, ttl, fetcher) {
@@ -36,11 +37,9 @@ async function fetchJson(path) {
 }
 
 // Current quote: { c: current, d: change, dp: %, h: high, l: low, o: open, pc: prev close }
-// Note: if Finnhub doesn't have the symbol (e.g. typo), it returns all zeros.
 export async function getQuote(symbol) {
   return cached(`quote:${symbol}`, CACHE_TTL.quote, async () => {
     const q = await fetchJson(`/quote?symbol=${symbol}`);
-    // Sanity check — if everything is zero, the symbol doesn't exist on Finnhub
     if (!q || (q.c === 0 && q.pc === 0)) {
       console.warn(`No quote data for ${symbol} — may be an invalid or unsupported symbol`);
     }
@@ -50,46 +49,69 @@ export async function getQuote(symbol) {
 
 // Company profile: { name, ticker, exchange, finnhubIndustry, logo, weburl, ... }
 export async function getProfile(symbol) {
-  return cached(`profile:${symbol}`, CACHE_TTL.profile, () => fetchJson(`/stock/profile2?symbol=${symbol}`));
+  return cached(`profile:${symbol}`, CACHE_TTL.profile, () =>
+    fetchJson(`/stock/profile2?symbol=${symbol}`)
+  );
 }
 
 // Company news. Returns array of { id, datetime, headline, source, summary, url, image, category }
 export async function getNews(symbol, daysBack = 7) {
-  const to = new Date();
+  const to   = new Date();
   const from = new Date(Date.now() - daysBack * 24 * 3600 * 1000);
-  const fmt = d => d.toISOString().slice(0, 10);
+  const fmt  = d => d.toISOString().slice(0, 10);
   return cached(`news:${symbol}:${daysBack}`, CACHE_TTL.news, () =>
     fetchJson(`/company-news?symbol=${symbol}&from=${fmt(from)}&to=${fmt(to)}`)
   );
 }
 
-// ---- Tighter impact classifier ----
-// Old version flagged almost everything as "high" because "announces"/"reports" appear constantly.
-// New version: only truly market-moving keywords count as HIGH. Most news is LOW.
+// Daily candle data for charting.
+// months: 1, 3, or 6
+// Returns array of { date: 'MMM D', close, open, high, low, volume }
+// sorted oldest → newest, ready for Recharts.
+export async function getCandles(symbol, months = 6) {
+  const now  = Math.floor(Date.now() / 1000);
+  const from = now - months * 30 * 24 * 3600;
 
+  return cached(`candle:${symbol}:${months}`, CACHE_TTL.candle, async () => {
+    const data = await fetchJson(
+      `/stock/candle?symbol=${symbol}&resolution=D&from=${from}&to=${now}`
+    );
+
+    if (!data || data.s !== 'ok' || !Array.isArray(data.t)) {
+      console.warn(`No candle data for ${symbol}:`, data?.s);
+      return [];
+    }
+
+    return data.t.map((ts, i) => ({
+      date:   new Date(ts * 1000).toLocaleDateString('en-US', { month: 'short', day: 'numeric' }),
+      ts,
+      close:  data.c[i],
+      open:   data.o[i],
+      high:   data.h[i],
+      low:    data.l[i],
+      volume: data.v[i],
+    }));
+  });
+}
+
+// ---- Impact classifier ----
 const HIGH_KEYWORDS = [
-  // Earnings/guidance surprises
   'beats estimates', 'misses estimates', 'beats expectations', 'misses expectations',
   'cuts guidance', 'raises guidance', 'lowers guidance', 'slashes guidance',
   'profit warning', 'earnings warning',
-  // Major corporate actions
   'acquires', 'acquisition', 'merger', 'spinoff', 'spin-off',
   'bankruptcy', 'chapter 11', 'going private',
-  // Leadership shocks
   'ceo steps down', 'ceo resigns', 'ceo fired', 'cfo resigns', 'cfo steps down',
-  // Regulatory / legal hits
   'sec charges', 'sec investigation', 'doj investigation', 'lawsuit', 'recall',
   'fda approval', 'fda rejects', 'fda denies',
-  // Security incidents
   'data breach', 'hacked', 'cyberattack',
-  // Major contracts
   'wins contract', 'awarded contract',
 ];
 
 const MED_KEYWORDS = [
   'upgrades', 'downgrades', 'price target', 'analyst', 'initiates coverage',
   'partnership', 'launches', 'unveils', 'expands',
-  'beats', 'misses', // looser earnings mentions
+  'beats', 'misses',
 ];
 
 export function classifyImpact(headline) {
@@ -101,7 +123,7 @@ export function classifyImpact(headline) {
 
 export function timeAgo(unixSeconds) {
   const diff = Date.now() / 1000 - unixSeconds;
-  if (diff < 3600) return `${Math.max(1, Math.floor(diff / 60))}m`;
+  if (diff < 3600)  return `${Math.max(1, Math.floor(diff / 60))}m`;
   if (diff < 86400) return `${Math.floor(diff / 3600)}h`;
   return `${Math.floor(diff / 86400)}d`;
 }
