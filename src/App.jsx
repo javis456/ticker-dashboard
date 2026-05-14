@@ -1,12 +1,12 @@
 import React, { useState, useEffect, useMemo, useCallback } from "react";
 import {
   TrendingUp, TrendingDown, Plus, X, Star, Bookmark, Search, FolderPlus,
-  ChevronRight, Bell, RefreshCw, ExternalLink, Cloud, CloudOff, Copy, Check
+  ChevronRight, Bell, RefreshCw, ExternalLink, Cloud, CloudOff, Copy, Check, Sparkles, Filter
 } from "lucide-react";
 import { getQuote, getProfile, getNews, classifyImpact, timeAgo } from "./lib/finnhub";
 import { supabase, getIdentity, setIdentity, loadState, saveState } from "./lib/supabase";
+import { tagNews, AVAILABLE_TAGS, TAG_STYLES } from "./lib/tagger";
 
-// ---- Default starter data (used on first load) ----
 const DEFAULT_STATE = {
   groups: [
     { id: "g1", name: "AI & Semis",    tickers: ["NVDA", "AMD"] },
@@ -23,12 +23,18 @@ const REMINDER_DAYS = 3;
 export default function App() {
   const [state, setState] = useState(DEFAULT_STATE);
   const [hydrated, setHydrated] = useState(false);
-  const [cloudStatus, setCloudStatus] = useState("connecting"); // connecting | synced | offline
+  const [cloudStatus, setCloudStatus] = useState("connecting");
 
-  const [quotes, setQuotes] = useState({});       // { TICKER: {c, d, dp} }
-  const [profiles, setProfiles] = useState({});   // { TICKER: { name, ... } }
-  const [newsByTicker, setNewsByTicker] = useState({}); // { TICKER: [items] }
+  const [quotes, setQuotes] = useState({});
+  const [profiles, setProfiles] = useState({});
+  const [newsByTicker, setNewsByTicker] = useState({});
   const [loadingTicker, setLoadingTicker] = useState({});
+
+  // AI Filter
+  const [tagsByNewsKey, setTagsByNewsKey] = useState({}); // { newsKey: [tags] }
+  const [activeTags, setActiveTags] = useState([]);       // selected filter tags
+  const [showFilter, setShowFilter] = useState(false);
+  const [taggingInProgress, setTaggingInProgress] = useState(false);
 
   const [showAddTicker, setShowAddTicker] = useState(false);
   const [showAddGroup, setShowAddGroup] = useState(false);
@@ -39,26 +45,19 @@ export default function App() {
   const [search, setSearch] = useState("");
   const [view, setView] = useState("feed");
 
-  // ---- Hydrate from Supabase (or fall back to defaults) ----
+  // ---- Hydrate from Supabase ----
   useEffect(() => {
     (async () => {
-      if (!supabase) {
-        setCloudStatus("offline");
-        setHydrated(true);
-        return;
-      }
+      if (!supabase) { setCloudStatus("offline"); setHydrated(true); return; }
       try {
         const saved = await loadState();
         if (saved) setState(saved);
         setCloudStatus("synced");
-      } catch {
-        setCloudStatus("offline");
-      }
+      } catch { setCloudStatus("offline"); }
       setHydrated(true);
     })();
   }, []);
 
-  // ---- Persist to Supabase on state change ----
   useEffect(() => {
     if (!hydrated) return;
     saveState(state);
@@ -70,7 +69,6 @@ export default function App() {
     return [...s];
   }, [state.groups]);
 
-  // ---- Fetch quote + profile + news for any new ticker ----
   const loadTicker = useCallback(async (tk) => {
     setLoadingTicker(prev => ({ ...prev, [tk]: true }));
     try {
@@ -101,7 +99,6 @@ export default function App() {
     });
   }, [hydrated, allTickers, quotes, loadingTicker, loadTicker]);
 
-  // Refresh quotes every 60s
   useEffect(() => {
     if (!hydrated) return;
     const id = setInterval(() => {
@@ -109,6 +106,21 @@ export default function App() {
     }, 60_000);
     return () => clearInterval(id);
   }, [hydrated, allTickers]);
+
+  // ---- Auto-tag any new headlines that don't have tags yet ----
+  useEffect(() => {
+    if (!hydrated) return;
+    const allNewsItems = Object.entries(newsByTicker).flatMap(([tk, arr]) =>
+      arr.map(n => ({ key: `${tk}_${n.id || n.url}`, headline: n.headline }))
+    );
+    const untagged = allNewsItems.filter(it => !tagsByNewsKey[it.key]);
+    if (untagged.length === 0) return;
+
+    setTaggingInProgress(true);
+    tagNews(untagged)
+      .then(tags => setTagsByNewsKey(prev => ({ ...prev, ...tags })))
+      .finally(() => setTaggingInProgress(false));
+  }, [hydrated, newsByTicker]); // eslint-disable-line
 
   const displayedTickers = useMemo(() => {
     if (state.activeGroup === "all") return allTickers;
@@ -118,8 +130,14 @@ export default function App() {
 
   const visibleNews = useMemo(() => {
     let items = displayedTickers.flatMap(tk =>
-      (newsByTicker[tk] || []).map(n => ({ ...n, ticker: tk }))
+      (newsByTicker[tk] || []).map(n => ({
+        ...n,
+        ticker: tk,
+        _key: `${tk}_${n.id || n.url}`,
+      }))
     );
+
+    // Text search
     if (search.trim()) {
       const q = search.toLowerCase();
       items = items.filter(n =>
@@ -128,8 +146,17 @@ export default function App() {
         n.ticker.toLowerCase().includes(q)
       );
     }
+
+    // AI Filter: OR semantics (show if matches ANY selected tag)
+    if (activeTags.length > 0) {
+      items = items.filter(n => {
+        const tags = tagsByNewsKey[n._key] || [];
+        return activeTags.some(t => tags.includes(t));
+      });
+    }
+
     return items.sort((a, b) => (b.datetime || 0) - (a.datetime || 0));
-  }, [displayedTickers, newsByTicker, search]);
+  }, [displayedTickers, newsByTicker, search, activeTags, tagsByNewsKey]);
 
   const pinnedItems = useMemo(
     () => Object.values(state.pinned).sort((a, b) => b.pinnedAt - a.pinnedAt),
@@ -137,7 +164,6 @@ export default function App() {
   );
   const remindersNeeded = pinnedItems.filter(p => (Date.now() - p.pinnedAt) / 86400000 >= REMINDER_DAYS);
 
-  // ---- Mutators ----
   const updateState = (fn) => setState(prev => fn(prev));
 
   const togglePin = (ticker, news) => updateState(s => {
@@ -186,7 +212,12 @@ export default function App() {
 
   const refreshAll = () => allTickers.forEach(loadTicker);
 
-  // ---- Derived for selected ticker ----
+  const toggleTag = (tag) => {
+    setActiveTags(prev => prev.includes(tag) ? prev.filter(t => t !== tag) : [...prev, tag]);
+  };
+
+  const clearTags = () => setActiveTags([]);
+
   const selected = state.selected;
   const quote = quotes[selected] || { c: 0, d: 0, dp: 0 };
   const profile = profiles[selected] || {};
@@ -195,7 +226,6 @@ export default function App() {
 
   return (
     <div className="min-h-screen w-full">
-      {/* HEADER */}
       <header className="border-b sticky top-0 z-20 backdrop-blur-md" style={{ borderColor: "#ececec", background: "rgba(250,250,247,0.85)" }}>
         <div className="max-w-7xl mx-auto px-8 py-4 flex items-center justify-between flex-wrap gap-4">
           <div className="flex items-center gap-8">
@@ -236,11 +266,9 @@ export default function App() {
         </div>
       </header>
 
-      {/* SYNC MODAL */}
       {showSync && <SyncModal onClose={() => setShowSync(false)} />}
 
       <div className="max-w-7xl mx-auto px-8 py-8 grid grid-cols-12 gap-8">
-        {/* SIDEBAR */}
         <aside className="col-span-3">
           <div className="flex items-center justify-between mb-3">
             <h2 className="text-xs font-semibold tracking-widest uppercase opacity-50">Groups</h2>
@@ -320,7 +348,6 @@ export default function App() {
           </div>
         </aside>
 
-        {/* MAIN */}
         <main className="col-span-9">
           {view === "feed" ? (
             <>
@@ -352,25 +379,91 @@ export default function App() {
               </section>
 
               <section>
-                <div className="flex items-center justify-between mb-4">
+                <div className="flex items-center justify-between mb-4 flex-wrap gap-3">
                   <h3 className="font-serif-h text-2xl font-semibold">
                     {state.activeGroup === "all" ? "All headlines" : state.groups.find(g => g.id === state.activeGroup)?.name}
                   </h3>
-                  <div className="text-xs opacity-50">{visibleNews.length} stories</div>
+                  <div className="flex items-center gap-2">
+                    <button
+                      onClick={() => setShowFilter(s => !s)}
+                      className="flex items-center gap-1.5 text-xs px-3 py-1.5 rounded-full font-medium transition"
+                      style={{
+                        background: activeTags.length > 0 || showFilter ? "#1a1a1a" : "white",
+                        color: activeTags.length > 0 || showFilter ? "#fafaf7" : "#1a1a1a",
+                        border: "1px solid " + (activeTags.length > 0 || showFilter ? "#1a1a1a" : "#e5e5e5"),
+                      }}
+                    >
+                      <Sparkles size={12} />
+                      AI Filter
+                      {activeTags.length > 0 && (
+                        <span className="text-[10px] px-1.5 py-0.5 rounded-full ml-1" style={{ background: "#fafaf7", color: "#1a1a1a" }}>{activeTags.length}</span>
+                      )}
+                    </button>
+                    <div className="text-xs opacity-50">{visibleNews.length} stories</div>
+                  </div>
                 </div>
+
+                {showFilter && (
+                  <div className="mb-4 p-4 rounded-xl fade-in" style={{ background: "white", border: "1px solid #ececec" }}>
+                    <div className="flex items-center justify-between mb-3">
+                      <div className="flex items-center gap-2">
+                        <Filter size={12} className="opacity-50" />
+                        <span className="text-xs font-semibold tracking-widest uppercase opacity-60">Filter by topic</span>
+                        {taggingInProgress && (
+                          <span className="text-[10px] opacity-50 flex items-center gap-1">
+                            <RefreshCw size={9} className="animate-spin" /> tagging…
+                          </span>
+                        )}
+                      </div>
+                      {activeTags.length > 0 && (
+                        <button onClick={clearTags} className="text-xs opacity-50 hover:opacity-100">Clear all</button>
+                      )}
+                    </div>
+                    <div className="flex flex-wrap gap-2">
+                      {AVAILABLE_TAGS.map(tag => {
+                        const active = activeTags.includes(tag);
+                        const style = TAG_STYLES[tag];
+                        return (
+                          <button
+                            key={tag}
+                            onClick={() => toggleTag(tag)}
+                            className="text-xs px-3 py-1.5 rounded-full font-medium transition-all"
+                            style={{
+                              background: active ? style.color : style.bg,
+                              color: active ? "white" : style.color,
+                              border: "1px solid " + (active ? style.color : "transparent"),
+                            }}
+                          >
+                            {tag}
+                          </button>
+                        );
+                      })}
+                    </div>
+                    <div className="mt-3 text-[11px] opacity-50">
+                      Showing news matching ANY selected tag. Tags are AI-generated and cached so each headline is analyzed once.
+                    </div>
+                  </div>
+                )}
+
                 <div className="space-y-3">
                   {visibleNews.map(n => (
                     <NewsCard
-                      key={n.ticker + "_" + (n.id || n.url)}
+                      key={n._key}
                       news={n}
+                      tags={tagsByNewsKey[n._key] || []}
                       pinned={!!state.pinned[String(n.id || n.url)]}
                       onPin={() => togglePin(n.ticker, n)}
                       onSelect={() => setSelected(n.ticker)}
+                      onTagClick={(tag) => toggleTag(tag)}
                     />
                   ))}
                   {visibleNews.length === 0 && (
                     <div className="text-center py-12 opacity-40 italic text-sm">
-                      {allTickers.some(tk => loadingTicker[tk]) ? "Loading news…" : "No headlines yet. Add a ticker to get started."}
+                      {activeTags.length > 0
+                        ? "No headlines match the selected tags."
+                        : allTickers.some(tk => loadingTicker[tk])
+                          ? "Loading news…"
+                          : "No headlines yet. Add a ticker to get started."}
                     </div>
                   )}
                 </div>
@@ -455,27 +548,36 @@ function GroupRow({ active, onClick, onRemove, name, count }) {
   );
 }
 
-function NewsCard({ news, pinned, onPin, onSelect }) {
-  const impactStyles = {
-    high: { bg: "#fee2e2", color: "#991b1b", label: "Big" },
-    med:  { bg: "#fef3c7", color: "#92400e", label: "Notable" },
-    low:  { bg: "#f0f0ec", color: "#525252", label: "Light" },
-  };
-  const imp = impactStyles[news.impact] || impactStyles.low;
-
+function NewsCard({ news, tags, pinned, onPin, onSelect, onTagClick }) {
   return (
     <article className="rounded-xl p-5 transition group" style={{ background: "white", border: "1px solid #ececec" }}>
       <div className="flex items-start justify-between gap-4">
         <div className="flex-1 min-w-0">
           <div className="flex items-center gap-2 mb-2 flex-wrap">
             <button onClick={onSelect} className="text-xs font-bold px-2 py-0.5 rounded-md transition hover:bg-gray-200" style={{ background: "#f0f0ec" }}>${news.ticker}</button>
-            <span className="text-[10px] font-semibold px-2 py-0.5 rounded-full uppercase tracking-wider" style={{ background: imp.bg, color: imp.color }}>{imp.label}</span>
             <span className="text-[11px] opacity-50">{news.source}</span>
             <span className="text-[11px] opacity-30">·</span>
             <span className="text-[11px] opacity-50">{news.tAgo} ago</span>
           </div>
           <a href={news.url} target="_blank" rel="noreferrer" className="font-serif-h text-lg font-semibold leading-snug mb-1.5 hover:underline block">{news.headline}</a>
-          {news.summary && <p className="text-sm opacity-60 leading-relaxed line-clamp-2">{news.summary}</p>}
+          {news.summary && <p className="text-sm opacity-60 leading-relaxed line-clamp-2 mb-2">{news.summary}</p>}
+          {tags.length > 0 && (
+            <div className="flex flex-wrap gap-1.5 mt-2">
+              {tags.map(tag => {
+                const style = TAG_STYLES[tag] || TAG_STYLES.Other;
+                return (
+                  <button
+                    key={tag}
+                    onClick={() => onTagClick && onTagClick(tag)}
+                    className="text-[10px] font-semibold px-2 py-0.5 rounded-full uppercase tracking-wider hover:opacity-80 transition"
+                    style={{ background: style.bg, color: style.color }}
+                  >
+                    {tag}
+                  </button>
+                );
+              })}
+            </div>
+          )}
         </div>
         <button onClick={onPin} className="flex-shrink-0 p-1.5 rounded-full transition opacity-40 group-hover:opacity-100 hover:bg-gray-100" title={pinned ? "Unpin" : "Pin & track"}>
           <Star size={16} fill={pinned ? "#fbbf24" : "none"} stroke={pinned ? "#fbbf24" : "currentColor"} />
@@ -486,7 +588,7 @@ function NewsCard({ news, pinned, onPin, onSelect }) {
 }
 
 function SyncModal({ onClose }) {
-  const [id, setIdState] = useState(getIdentity());
+  const [id] = useState(getIdentity());
   const [draft, setDraft] = useState(id);
   const [copied, setCopied] = useState(false);
 
@@ -506,9 +608,7 @@ function SyncModal({ onClose }) {
     <div onClick={onClose} className="fixed inset-0 z-50 flex items-center justify-center p-4" style={{ background: "rgba(0,0,0,0.4)" }}>
       <div onClick={e => e.stopPropagation()} className="w-full max-w-md rounded-2xl p-6 fade-in" style={{ background: "white" }}>
         <h3 className="font-serif-h text-xl font-semibold mb-2">Sync across devices</h3>
-        <p className="text-sm opacity-60 mb-4">
-          Copy this ID, then open Ticker on another device and paste it in below to share the same data.
-        </p>
+        <p className="text-sm opacity-60 mb-4">Copy this ID, then open Ticker on another device and paste it in below to share the same data.</p>
         <label className="text-xs font-semibold tracking-widest uppercase opacity-50">Your sync ID</label>
         <div className="flex gap-2 mt-1 mb-4">
           <input readOnly value={id} className="flex-1 text-xs font-mono px-3 py-2 rounded-md" style={{ background: "#f7f7f3", border: "1px solid #e5e5e5" }} />
