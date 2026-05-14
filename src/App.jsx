@@ -1,8 +1,9 @@
-import React, { useState, useEffect, useMemo, useCallback, useRef } from "react";
+import React, { useState, useEffect, useMemo, useCallback } from "react";
 import {
   TrendingUp, TrendingDown, Plus, X, Star, Bookmark, Search, FolderPlus,
-  ChevronRight, Bell, RefreshCw, ExternalLink, Cloud, CloudOff, Copy, Check,
-  Sparkles, Filter, Eye, Trash2, AlertCircle, Tag, Layers
+  ChevronRight, ChevronDown, Bell, RefreshCw, ExternalLink, Cloud, CloudOff,
+  Copy, Check, Sparkles, Filter, Eye, Trash2, AlertCircle, Tag, Layers,
+  CheckCheck
 } from "lucide-react";
 import { AreaChart, Area, XAxis, YAxis, Tooltip, ResponsiveContainer } from "recharts";
 import { getQuote, getProfile, getNews, getCandles, classifyImpact, timeAgo } from "./lib/finnhub";
@@ -21,12 +22,11 @@ const DEFAULT_STATE = {
     { id: "g1", name: "AI & Semis",    tickers: ["NVDA", "AMD"] },
     { id: "g2", name: "My Watchlist",  tickers: ["AAPL", "MSFT", "GOOGL", "TSLA"] },
   ],
-  selected:    "NVDA",
-  activeTab:   "sector",   // "sector" | "custom"
-  activeGroup: "s1",
-  pinned:      {},
-  watchKeywords: [],        // [{ id, keyword, createdAt }]
-  watchMatches:  {},        // { matchId: { keyword, ticker, news, matchedAt } }
+  selected:     "NVDA",
+  activeTab:    "sector",
+  activeGroup:  "s1",
+  pinned:       {},
+  watchCards:   [],   // [{ id, ticker, keyword, createdAt, isOpen, matches: [...], seenMatchIds: {} }]
 };
 
 const REMINDER_DAYS = 3;
@@ -35,20 +35,24 @@ const REMINDER_DAYS = 3;
 function formatTimestamp(unixSeconds) {
   if (!unixSeconds) return "";
   const d = new Date(unixSeconds * 1000);
-  const now = new Date();
-  const isToday = d.toDateString() === now.toDateString();
+  const isToday = d.toDateString() === new Date().toDateString();
   const timeStr = d.toLocaleTimeString("en-US", { hour: "numeric", minute: "2-digit", hour12: true });
-  if (isToday) return timeStr;
-  return d.toLocaleDateString("en-US", { month: "short", day: "numeric" }) + " · " + timeStr;
+  return isToday ? timeStr : d.toLocaleDateString("en-US", { month: "short", day: "numeric" }) + " · " + timeStr;
+}
+
+function timeSinceText(ms) {
+  const diff = (Date.now() - ms) / 1000;
+  if (diff < 60)       return "just now";
+  if (diff < 3600)     return `${Math.floor(diff / 60)}m ago`;
+  if (diff < 86400)    return `${Math.floor(diff / 3600)}h ago`;
+  if (diff < 86400 * 7) return `${Math.floor(diff / 86400)}d ago`;
+  if (diff < 86400 * 30) return `${Math.floor(diff / 86400 / 7)}w ago`;
+  return `${Math.floor(diff / 86400 / 30)}mo ago`;
 }
 
 function matchesKeyword(keyword, news) {
   const kw = keyword.toLowerCase();
-  const haystack = [
-    news.headline  || "",
-    news.summary   || "",
-  ].join(" ").toLowerCase();
-  return haystack.includes(kw);
+  return ((news.headline || "") + " " + (news.summary || "")).toLowerCase().includes(kw);
 }
 
 // ─── Sub-components ───────────────────────────────────────────────────────────
@@ -70,16 +74,13 @@ function PriceChart({ symbol, isUp }) {
   useEffect(() => {
     if (!symbol) return;
     setLoading(true);
-    getCandles(symbol, range)
-      .then(data => setCandles(data))
-      .catch(() => setCandles([]))
-      .finally(() => setLoading(false));
+    getCandles(symbol, range).then(setCandles).catch(() => setCandles([])).finally(() => setLoading(false));
   }, [symbol, range]);
 
-  const color   = isUp ? "#059669" : "#dc2626";
-  const fillId  = `fill-${symbol}`;
-  const minC    = useMemo(() => candles.length ? Math.min(...candles.map(c => c.close)) * 0.995 : 0, [candles]);
-  const maxC    = useMemo(() => candles.length ? Math.max(...candles.map(c => c.close)) * 1.005 : 0, [candles]);
+  const color = isUp ? "#059669" : "#dc2626";
+  const fillId = `fill-${symbol}`;
+  const minC = useMemo(() => candles.length ? Math.min(...candles.map(c => c.close)) * 0.995 : 0, [candles]);
+  const maxC = useMemo(() => candles.length ? Math.max(...candles.map(c => c.close)) * 1.005 : 0, [candles]);
   const tickInterval = Math.max(1, Math.floor(candles.length / 6));
 
   if (loading) return <div className="h-36 flex items-center justify-center opacity-30 text-xs">Loading chart…</div>;
@@ -165,6 +166,8 @@ function NewsCard({ news, tags, pinned, onPin, onSelect, onTagClick }) {
             <span className="text-[11px] opacity-50">{news.source}</span>
             <span className="text-[11px] opacity-30">·</span>
             <span className="text-[11px] opacity-50">{formatTimestamp(news.datetime)}</span>
+            <span className="text-[11px] opacity-30">·</span>
+            <span className="text-[11px] opacity-50">{news.tAgo} ago</span>
           </div>
           <a href={news.url} target="_blank" rel="noreferrer" className="font-serif-h text-lg font-semibold leading-snug mb-1.5 hover:underline block">{news.headline}</a>
           {news.summary && <p className="text-sm opacity-60 leading-relaxed line-clamp-2 mb-2">{news.summary}</p>}
@@ -220,6 +223,116 @@ function SyncModal({ onClose }) {
   );
 }
 
+// ─── Watching Card component ──────────────────────────────────────────────────
+function WatchingCard({ card, onToggleOpen, onDelete, onMarkRead, onMarkAllRead, onDismissMatch, onJumpTo }) {
+  const unreadCount = card.matches.filter(m => !m.isRead).length;
+  const ticksColor  = unreadCount > 0 ? "#059669" : "#a3a3a3";
+
+  return (
+    <div className="rounded-2xl fade-in overflow-hidden"
+      style={{
+        background: "white",
+        border: unreadCount > 0 ? "1px solid #6ee7b7" : "1px solid #ececec",
+        boxShadow: unreadCount > 0 ? "0 0 0 3px #ecfdf5" : "none",
+      }}>
+      {/* HEADER */}
+      <div className="p-5 cursor-pointer" onClick={onToggleOpen}>
+        <div className="flex items-start justify-between gap-3 mb-3">
+          <div className="flex items-center gap-2 flex-wrap">
+            <span className="text-xs font-bold px-2 py-0.5 rounded-md" style={{ background: "#f0f0ec" }}>${card.ticker}</span>
+            <span className="text-[11px] opacity-40">+</span>
+            <span className="text-xs font-medium px-2 py-0.5 rounded-md flex items-center gap-1" style={{ background: "#f0f0ec", color: "#1a1a1a" }}>
+              <Eye size={10} className="opacity-50" /> {card.keyword}
+            </span>
+          </div>
+          <div className="flex items-center gap-2">
+            {unreadCount > 0 && (
+              <div className="flex items-center gap-1 px-2 py-1 rounded-full text-[11px] font-bold" style={{ background: "#059669", color: "white" }}>
+                <Bell size={10} /> {unreadCount} new
+              </div>
+            )}
+            <button
+              onClick={e => { e.stopPropagation(); onDelete(); }}
+              className="p-1.5 rounded-full opacity-40 hover:opacity-100 hover:bg-red-50 transition"
+              style={{ color: "#dc2626" }}>
+              <Trash2 size={13} />
+            </button>
+            <button onClick={onToggleOpen} className="p-1.5 rounded-full opacity-40 hover:opacity-100 hover:bg-gray-100 transition">
+              {card.isOpen ? <ChevronDown size={14} /> : <ChevronRight size={14} />}
+            </button>
+          </div>
+        </div>
+
+        <div className="flex items-center gap-3 text-[11px] opacity-50">
+          <span>Created {timeSinceText(card.createdAt)}</span>
+          <span>·</span>
+          <span style={{ color: ticksColor }}>
+            {card.matches.length === 0 ? "No matches yet" : `${card.matches.length} match${card.matches.length === 1 ? "" : "es"} total`}
+          </span>
+        </div>
+      </div>
+
+      {/* MATCHES */}
+      {card.isOpen && (
+        <div className="border-t" style={{ borderColor: "#f0f0ec" }}>
+          {card.matches.length === 0 ? (
+            <div className="px-5 py-6 text-center text-xs opacity-40 italic">
+              Watching for new ${card.ticker} headlines mentioning "{card.keyword}"…
+            </div>
+          ) : (
+            <>
+              {unreadCount > 0 && (
+                <div className="px-5 py-2.5 flex items-center justify-end" style={{ background: "#fafaf7", borderBottom: "1px solid #f0f0ec" }}>
+                  <button onClick={() => onMarkAllRead()}
+                    className="text-[11px] font-medium flex items-center gap-1 opacity-60 hover:opacity-100 transition">
+                    <CheckCheck size={11} /> Mark all read
+                  </button>
+                </div>
+              )}
+              <div className="divide-y" style={{ borderColor: "#f0f0ec" }}>
+                {card.matches.sort((a, b) => (b.datetime || 0) - (a.datetime || 0)).map(m => (
+                  <div key={m.id} className="px-5 py-4 transition group" style={{ background: m.isRead ? "white" : "#f0fdf4" }}>
+                    <div className="flex items-start justify-between gap-3">
+                      <div className="flex-1 min-w-0">
+                        <div className="flex items-center gap-2 mb-1.5 flex-wrap">
+                          {!m.isRead && <div className="w-1.5 h-1.5 rounded-full" style={{ background: "#059669" }} />}
+                          <span className="text-[11px] opacity-50">{m.source}</span>
+                          <span className="text-[11px] opacity-30">·</span>
+                          <span className="text-[11px] opacity-50">{formatTimestamp(m.datetime)}</span>
+                          <span className="text-[11px] opacity-30">·</span>
+                          <span className="text-[11px] opacity-50">{timeAgo(m.datetime)} ago</span>
+                        </div>
+                        <a href={m.url} target="_blank" rel="noreferrer"
+                          onClick={() => !m.isRead && onMarkRead(m.id)}
+                          className="font-serif-h text-base font-semibold leading-snug hover:underline block mb-1">
+                          {m.headline}
+                        </a>
+                        {m.summary && <p className="text-xs opacity-60 leading-relaxed line-clamp-2">{m.summary}</p>}
+                      </div>
+                      <div className="flex flex-col gap-1 opacity-40 group-hover:opacity-100 transition">
+                        {!m.isRead && (
+                          <button onClick={() => onMarkRead(m.id)} title="Mark read"
+                            className="p-1 rounded hover:bg-gray-100" style={{ color: "#059669" }}>
+                            <Check size={12} />
+                          </button>
+                        )}
+                        <button onClick={() => onDismissMatch(m.id)} title="Delete this match"
+                          className="p-1 rounded hover:bg-gray-100">
+                          <X size={12} />
+                        </button>
+                      </div>
+                    </div>
+                  </div>
+                ))}
+              </div>
+            </>
+          )}
+        </div>
+      )}
+    </div>
+  );
+}
+
 // ─── Main App ─────────────────────────────────────────────────────────────────
 export default function App() {
   const [state, setState]       = useState(DEFAULT_STATE);
@@ -243,30 +356,45 @@ export default function App() {
   const [newTickerGroup, setNewTickerGroup] = useState("");
   const [newGroupName, setNewGroupName]   = useState("");
   const [search, setSearch]   = useState("");
-  const [view, setView]       = useState("feed"); // feed | pinned | watching
+  const [view, setView]       = useState("feed");
 
-  // Delete confirmation
-  const [confirmDelete, setConfirmDelete] = useState(null); // { type: 'ticker'|'group', id, label }
+  const [confirmDelete, setConfirmDelete] = useState(null);
 
-  // Watching
-  const [newKeyword, setNewKeyword] = useState("");
+  // Watching card creation form
+  const [newCardTicker,  setNewCardTicker]  = useState("");
+  const [newCardKeyword, setNewCardKeyword] = useState("");
 
-  // Hydrate
+  // Track total unread for browser-title alert effect
+  const totalUnread = useMemo(
+    () => (state.watchCards || []).reduce((sum, c) => sum + c.matches.filter(m => !m.isRead).length, 0),
+    [state.watchCards]
+  );
+
+  useEffect(() => {
+    document.title = totalUnread > 0 ? `(${totalUnread}) Ticker · alerts` : "Ticker — Your market, distilled";
+  }, [totalUnread]);
+
+  // ── Hydrate ────────────────────────────────────────────────────────────────
   useEffect(() => {
     (async () => {
       if (!supabase) { setCloudStatus("offline"); setHydrated(true); return; }
       try {
         const saved = await loadState();
-        if (saved) setState(prev => ({
-          ...DEFAULT_STATE,
-          ...saved,
-          // Ensure new keys exist if loading old saved state
-          sectorGroups:  saved.sectorGroups  || DEFAULT_STATE.sectorGroups,
-          customGroups:  saved.customGroups  || DEFAULT_STATE.customGroups,
-          watchKeywords: saved.watchKeywords || [],
-          watchMatches:  saved.watchMatches  || {},
-          activeTab:     saved.activeTab     || "sector",
-        }));
+        if (saved) {
+          // Migrate old state shapes
+          const migrated = {
+            ...DEFAULT_STATE,
+            ...saved,
+            sectorGroups: saved.sectorGroups || DEFAULT_STATE.sectorGroups,
+            customGroups: saved.customGroups || DEFAULT_STATE.customGroups,
+            watchCards:   saved.watchCards   || [],
+            activeTab:    saved.activeTab    || "sector",
+          };
+          // Drop deprecated keys from before card-based watching
+          delete migrated.watchKeywords;
+          delete migrated.watchMatches;
+          setState(migrated);
+        }
         setCloudStatus("synced");
       } catch { setCloudStatus("offline"); }
       setHydrated(true);
@@ -275,21 +403,21 @@ export default function App() {
 
   useEffect(() => { if (hydrated) saveState(state); }, [state, hydrated]);
 
-  // Derived: all unique tickers across both group types
+  // ── Tickers we need to fetch news for (groups + watching cards) ────────────
   const allTickers = useMemo(() => {
     const s = new Set();
     [...(state.sectorGroups || []), ...(state.customGroups || [])].forEach(g => g.tickers.forEach(t => s.add(t)));
+    (state.watchCards || []).forEach(c => s.add(c.ticker));
     return [...s];
-  }, [state.sectorGroups, state.customGroups]);
+  }, [state.sectorGroups, state.customGroups, state.watchCards]);
 
   const activeGroups = state.activeTab === "sector" ? (state.sectorGroups || []) : (state.customGroups || []);
-
   const displayedTickers = useMemo(() => {
     const g = activeGroups.find(g => g.id === state.activeGroup);
     return g ? g.tickers : [];
   }, [activeGroups, state.activeGroup]);
 
-  // Load ticker data
+  // ── Load data ──────────────────────────────────────────────────────────────
   const loadTicker = useCallback(async (tk) => {
     setLoadingTicker(prev => ({ ...prev, [tk]: true }));
     try {
@@ -325,37 +453,71 @@ export default function App() {
   // Auto-tag
   useEffect(() => {
     if (!hydrated) return;
-    const allItems = Object.entries(newsByTicker).flatMap(([tk, arr]) =>
+    const items = Object.entries(newsByTicker).flatMap(([tk, arr]) =>
       arr.map(n => ({ key: `${tk}_${n.id || n.url}`, headline: n.headline }))
     );
-    const untagged = allItems.filter(it => !tagsByNewsKey[it.key]);
+    const untagged = items.filter(it => !tagsByNewsKey[it.key]);
     if (!untagged.length) return;
     setTaggingInProgress(true);
     tagNews(untagged).then(tags => setTagsByNewsKey(prev => ({ ...prev, ...tags }))).finally(() => setTaggingInProgress(false));
   }, [hydrated, newsByTicker]); // eslint-disable-line
 
-  // ── Keyword watching: scan new articles against keywords ──────────────────
+  // ── Watching: scan news for matches AFTER each card's creation time ───────
   useEffect(() => {
-    if (!hydrated || !state.watchKeywords?.length) return;
-    const newMatches = {};
-    allTickers.forEach(tk => {
-      (newsByTicker[tk] || []).forEach(news => {
-        state.watchKeywords.forEach(kw => {
-          if (matchesKeyword(kw.keyword, news)) {
-            const matchId = `${kw.id}_${news.id || news.url}`;
-            if (!state.watchMatches?.[matchId]) {
-              newMatches[matchId] = { keyword: kw.keyword, ticker: tk, news, matchedAt: Date.now() };
-            }
-          }
+    if (!hydrated || !(state.watchCards?.length)) return;
+
+    let changed = false;
+    const updated = state.watchCards.map(card => {
+      const articles = newsByTicker[card.ticker] || [];
+      const cardCreatedSec = Math.floor(card.createdAt / 1000);
+      const existing = new Set(card.matches.map(m => m.newsId));
+      const newOnes = [];
+
+      articles.forEach(art => {
+        // Only news published after card creation
+        if ((art.datetime || 0) < cardCreatedSec) return;
+        // Must match keyword
+        if (!matchesKeyword(card.keyword, art)) return;
+
+        const newsId = String(art.id || art.url);
+        if (existing.has(newsId)) return;
+
+        newOnes.push({
+          id:        "m" + Date.now() + "_" + Math.random().toString(36).slice(2, 8),
+          newsId,
+          headline:  art.headline,
+          summary:   art.summary,
+          datetime:  art.datetime,
+          url:       art.url,
+          source:    art.source,
+          isRead:    false,
+          matchedAt: Date.now(),
         });
       });
-    });
-    if (Object.keys(newMatches).length > 0) {
-      updateState(s => ({ ...s, watchMatches: { ...(s.watchMatches || {}), ...newMatches } }));
-    }
-  }, [hydrated, newsByTicker, state.watchKeywords]); // eslint-disable-line
 
-  // ── Derived news lists ────────────────────────────────────────────────────
+      if (newOnes.length === 0) return card;
+      changed = true;
+      return { ...card, matches: [...card.matches, ...newOnes] };
+    });
+
+    if (changed) {
+      setState(s => ({ ...s, watchCards: updated }));
+      // Browser notification (non-blocking, fire and forget)
+      if ("Notification" in window && Notification.permission === "granted") {
+        const newCount = updated.reduce((acc, c, i) => acc + (c.matches.length - state.watchCards[i].matches.length), 0);
+        if (newCount > 0) {
+          try {
+            new Notification("Ticker · new alert", {
+              body: `${newCount} new headline${newCount > 1 ? "s" : ""} matched your watching cards`,
+              icon: "/favicon.svg",
+            });
+          } catch {}
+        }
+      }
+    }
+  }, [hydrated, newsByTicker, state.watchCards]); // eslint-disable-line
+
+  // ── Visible news for feed ──────────────────────────────────────────────────
   const visibleNews = useMemo(() => {
     let items = displayedTickers.flatMap(tk =>
       (newsByTicker[tk] || []).map(n => ({ ...n, ticker: tk, _key: `${tk}_${n.id || n.url}` }))
@@ -369,32 +531,36 @@ export default function App() {
       );
     }
     if (activeTags.length > 0) {
-      items = items.filter(n => {
-        const tags = tagsByNewsKey[n._key] || [];
-        return activeTags.some(t => tags.includes(t));
-      });
+      items = items.filter(n => activeTags.some(t => (tagsByNewsKey[n._key] || []).includes(t)));
     }
     return items.sort((a, b) => (b.datetime || 0) - (a.datetime || 0));
   }, [displayedTickers, newsByTicker, search, activeTags, tagsByNewsKey]);
 
-  const pinnedItems   = useMemo(() => Object.values(state.pinned || {}).sort((a, b) => b.pinnedAt - a.pinnedAt), [state.pinned]);
-  const watchItems    = useMemo(() => Object.values(state.watchMatches || {}).sort((a, b) => b.matchedAt - a.matchedAt), [state.watchMatches]);
-  const newWatchCount = watchItems.length; // could track "seen" in future
+  const pinnedItems = useMemo(() => Object.values(state.pinned || {}).sort((a, b) => b.pinnedAt - a.pinnedAt), [state.pinned]);
   const remindersNeeded = pinnedItems.filter(p => (Date.now() - p.pinnedAt) / 86400000 >= REMINDER_DAYS);
+
+  // Watching cards sorted: unread first, then by creation time desc
+  const sortedCards = useMemo(() => {
+    return [...(state.watchCards || [])].sort((a, b) => {
+      const aUnread = a.matches.filter(m => !m.isRead).length;
+      const bUnread = b.matches.filter(m => !m.isRead).length;
+      if (aUnread !== bUnread) return bUnread - aUnread;
+      return b.createdAt - a.createdAt;
+    });
+  }, [state.watchCards]);
 
   // ── Mutators ──────────────────────────────────────────────────────────────
   const updateState = fn => setState(prev => fn(prev));
-
-  const setSelected    = tk  => updateState(s => ({ ...s, selected: tk }));
-  const setActiveGroup = id  => updateState(s => ({ ...s, activeGroup: id }));
-  const setActiveTab   = tab => {
+  const setSelected = tk  => updateState(s => ({ ...s, selected: tk }));
+  const setActiveGroup = id => updateState(s => ({ ...s, activeGroup: id }));
+  const setActiveTab = tab => {
     const groups = tab === "sector" ? state.sectorGroups : state.customGroups;
     updateState(s => ({ ...s, activeTab: tab, activeGroup: groups?.[0]?.id || "" }));
   };
 
   const togglePin = (ticker, news) => updateState(s => {
     const next = { ...s.pinned };
-    const key  = String(news.id || news.url);
+    const key = String(news.id || news.url);
     if (next[key]) delete next[key]; else next[key] = { ticker, news, pinnedAt: Date.now(), key };
     return { ...s, pinned: next };
   });
@@ -404,13 +570,11 @@ export default function App() {
     if (!t) return;
     const targetId = newTickerGroup;
     updateState(s => {
-      const updateGroups = (groups) => groups.map(g =>
-        g.id === targetId && !g.tickers.includes(t) ? { ...g, tickers: [...g.tickers, t] } : g
-      );
+      const upd = (groups) => groups.map(g => g.id === targetId && !g.tickers.includes(t) ? { ...g, tickers: [...g.tickers, t] } : g);
       return {
         ...s,
-        sectorGroups: state.activeTab === "sector" ? updateGroups(s.sectorGroups) : s.sectorGroups,
-        customGroups: state.activeTab === "custom" ? updateGroups(s.customGroups) : s.customGroups,
+        sectorGroups: state.activeTab === "sector" ? upd(s.sectorGroups) : s.sectorGroups,
+        customGroups: state.activeTab === "custom" ? upd(s.customGroups) : s.customGroups,
         selected: t,
       };
     });
@@ -423,21 +587,17 @@ export default function App() {
     if (!name) return;
     const id = "g" + Date.now();
     updateState(s => {
-      if (state.activeTab === "sector") {
+      if (state.activeTab === "sector")
         return { ...s, sectorGroups: [...s.sectorGroups, { id, name, tickers: [] }], activeGroup: id };
-      }
       return { ...s, customGroups: [...s.customGroups, { id, name, tickers: [] }], activeGroup: id };
     });
     setNewGroupName(""); setShowAddGroup(false);
   };
 
-  // Deletion with confirmation
-  const requestDeleteTicker = (tk) => {
-    setConfirmDelete({ type: "ticker", id: tk, label: `$${tk}` });
-  };
-  const requestDeleteGroup = (gid, name) => {
-    setConfirmDelete({ type: "group", id: gid, label: `"${name}"` });
-  };
+  const requestDeleteTicker = (tk) => setConfirmDelete({ type: "ticker", id: tk, label: `$${tk}` });
+  const requestDeleteGroup  = (gid, name) => setConfirmDelete({ type: "group", id: gid, label: `"${name}"` });
+  const requestDeleteCard   = (cardId, label) => setConfirmDelete({ type: "card", id: cardId, label });
+
   const executeDelete = () => {
     if (!confirmDelete) return;
     if (confirmDelete.type === "ticker") {
@@ -447,7 +607,7 @@ export default function App() {
         sectorGroups: s.sectorGroups.map(g => ({ ...g, tickers: g.tickers.filter(t => t !== tk) })),
         customGroups: s.customGroups.map(g => ({ ...g, tickers: g.tickers.filter(t => t !== tk) })),
       }));
-    } else {
+    } else if (confirmDelete.type === "group") {
       const gid = confirmDelete.id;
       updateState(s => {
         if (state.activeTab === "sector") {
@@ -457,35 +617,63 @@ export default function App() {
         const next = s.customGroups.filter(g => g.id !== gid);
         return { ...s, customGroups: next, activeGroup: next[0]?.id || "" };
       });
+    } else if (confirmDelete.type === "card") {
+      const cardId = confirmDelete.id;
+      updateState(s => ({ ...s, watchCards: s.watchCards.filter(c => c.id !== cardId) }));
     }
     setConfirmDelete(null);
   };
 
-  // Watching keywords
-  const addKeyword = () => {
-    const kw = newKeyword.trim();
-    if (!kw) return;
-    const id = "kw" + Date.now();
-    updateState(s => ({ ...s, watchKeywords: [...(s.watchKeywords || []), { id, keyword: kw, createdAt: Date.now() }] }));
-    setNewKeyword("");
-  };
-  const removeKeyword = (id) => {
+  // Watching card actions
+  const createWatchCard = () => {
+    const ticker  = newCardTicker.trim().toUpperCase();
+    const keyword = newCardKeyword.trim();
+    if (!ticker || !keyword) return;
+
+    // Request notification permission on first card if not yet decided
+    if ("Notification" in window && Notification.permission === "default") {
+      Notification.requestPermission();
+    }
+
+    const id = "wc" + Date.now();
     updateState(s => ({
       ...s,
-      watchKeywords: s.watchKeywords.filter(k => k.id !== id),
-      watchMatches:  Object.fromEntries(Object.entries(s.watchMatches || {}).filter(([matchId]) => !matchId.startsWith(id + "_"))),
+      watchCards: [
+        { id, ticker, keyword, createdAt: Date.now(), isOpen: true, matches: [] },
+        ...s.watchCards
+      ],
     }));
-  };
-  const removeWatchMatch = (matchId) => {
-    updateState(s => {
-      const next = { ...s.watchMatches };
-      delete next[matchId];
-      return { ...s, watchMatches: next };
-    });
+    setNewCardTicker(""); setNewCardKeyword("");
+    if (!quotes[ticker]) loadTicker(ticker);
   };
 
-  const toggleTag  = tag  => setActiveTags(prev => prev.includes(tag) ? prev.filter(t => t !== tag) : [...prev, tag]);
-  const refreshAll = ()   => allTickers.forEach(loadTicker);
+  const toggleCardOpen = (cardId) => updateState(s => ({
+    ...s, watchCards: s.watchCards.map(c => c.id === cardId ? { ...c, isOpen: !c.isOpen } : c)
+  }));
+
+  const markMatchRead = (cardId, matchId) => updateState(s => ({
+    ...s,
+    watchCards: s.watchCards.map(c => c.id !== cardId ? c : {
+      ...c, matches: c.matches.map(m => m.id === matchId ? { ...m, isRead: true } : m)
+    })
+  }));
+
+  const markAllRead = (cardId) => updateState(s => ({
+    ...s,
+    watchCards: s.watchCards.map(c => c.id !== cardId ? c : {
+      ...c, matches: c.matches.map(m => ({ ...m, isRead: true }))
+    })
+  }));
+
+  const dismissMatch = (cardId, matchId) => updateState(s => ({
+    ...s,
+    watchCards: s.watchCards.map(c => c.id !== cardId ? c : {
+      ...c, matches: c.matches.filter(m => m.id !== matchId)
+    })
+  }));
+
+  const toggleTag  = tag => setActiveTags(prev => prev.includes(tag) ? prev.filter(t => t !== tag) : [...prev, tag]);
+  const refreshAll = ()  => allTickers.forEach(loadTicker);
 
   const selected = state.selected;
   const quote    = quotes[selected]   || { c: 0, d: 0, dp: 0 };
@@ -493,16 +681,13 @@ export default function App() {
   const isUp     = (quote.d || 0) >= 0;
   const daysSince = ts => Math.floor((Date.now() - ts) / 86400000);
 
-  // Init default group selection
   useEffect(() => {
     if (!hydrated) return;
     const groups = state.activeTab === "sector" ? state.sectorGroups : state.customGroups;
-    if (!groups.find(g => g.id === state.activeGroup) && groups.length > 0) {
+    if (!groups.find(g => g.id === state.activeGroup) && groups.length > 0)
       updateState(s => ({ ...s, activeGroup: groups[0].id }));
-    }
   }, [hydrated, state.activeTab]); // eslint-disable-line
 
-  // Set default group target when add-ticker opens
   useEffect(() => {
     if (showAddTicker) {
       const groups = state.activeTab === "sector" ? state.sectorGroups : state.customGroups;
@@ -524,17 +709,17 @@ export default function App() {
               {[
                 { id: "feed",     label: "Feed" },
                 { id: "pinned",   label: "Pinned",   badge: pinnedItems.length },
-                { id: "watching", label: "Watching", badge: newWatchCount, badgeColor: "#059669" },
+                { id: "watching", label: "Watching", badge: totalUnread, badgeColor: "#059669" },
               ].map(tab => (
                 <button key={tab.id} onClick={() => setView(tab.id)}
                   className="px-3 py-1.5 text-sm rounded-full transition-all flex items-center gap-1.5"
                   style={{ background: view === tab.id ? "#1a1a1a" : "transparent", color: view === tab.id ? "#fafaf7" : "#1a1a1a" }}>
                   {tab.label}
                   {tab.badge > 0 && (
-                    <span className="text-[10px] px-1.5 py-0.5 rounded-full"
+                    <span className="text-[10px] px-1.5 py-0.5 rounded-full font-semibold"
                       style={{
                         background: view === tab.id ? "#fafaf7" : (tab.badgeColor || "#1a1a1a"),
-                        color: view === tab.id ? "#1a1a1a" : "#fafaf7",
+                        color:      view === tab.id ? "#1a1a1a" : "#fafaf7",
                       }}>
                       {tab.badge}
                     </span>
@@ -564,22 +749,22 @@ export default function App() {
         </div>
       </header>
 
-      {showSync     && <SyncModal onClose={() => setShowSync(false)} />}
+      {showSync && <SyncModal onClose={() => setShowSync(false)} />}
       {confirmDelete && (
         <ConfirmModal
           title={`Remove ${confirmDelete.label}?`}
           message={confirmDelete.type === "ticker"
-            ? `${confirmDelete.label} will be removed from all groups. Your pinned news and watch matches for this ticker are kept.`
-            : `The group ${confirmDelete.label} will be deleted. Tickers inside are not deleted — they remain in other groups.`}
+            ? `${confirmDelete.label} will be removed from all groups. Pinned news and watching cards using this ticker are kept.`
+            : confirmDelete.type === "group"
+              ? `The group ${confirmDelete.label} will be deleted. Tickers inside are not deleted — they remain in other groups.`
+              : `The watching card ${confirmDelete.label} and all its saved matches will be permanently removed.`}
           onConfirm={executeDelete}
-          onCancel={() => setConfirmDelete(null)}
-        />
+          onCancel={() => setConfirmDelete(null)} />
       )}
 
       <div className="max-w-7xl mx-auto px-8 py-8 grid grid-cols-12 gap-8">
         {/* ── SIDEBAR ── */}
         <aside className="col-span-3">
-          {/* Group type tabs */}
           <div className="flex gap-1 mb-4 p-1 rounded-xl" style={{ background: "#f0f0ec" }}>
             <button onClick={() => setActiveTab("sector")}
               className="flex-1 flex items-center justify-center gap-1.5 py-1.5 text-xs font-semibold rounded-lg transition-all"
@@ -593,7 +778,6 @@ export default function App() {
             </button>
           </div>
 
-          {/* Groups list */}
           <div className="flex items-center justify-between mb-2">
             <h2 className="text-xs font-semibold tracking-widest uppercase opacity-50">
               {state.activeTab === "sector" ? "Sectors" : "My Groups"}
@@ -622,7 +806,6 @@ export default function App() {
             {activeGroups.length === 0 && <div className="text-xs opacity-40 italic px-3 py-2">No groups yet.</div>}
           </div>
 
-          {/* Tickers in active group */}
           <div className="flex items-center justify-between mb-2">
             <h2 className="text-xs font-semibold tracking-widest uppercase opacity-50">Tickers</h2>
             <button onClick={() => setShowAddTicker(true)} className="opacity-50 hover:opacity-100 transition"><Plus size={14} /></button>
@@ -648,8 +831,8 @@ export default function App() {
 
           <div className="space-y-1">
             {displayedTickers.map(tk => {
-              const p   = quotes[tk] || { c: 0, d: 0, dp: 0 };
-              const up  = (p.d || 0) >= 0;
+              const p = quotes[tk] || { c: 0, d: 0, dp: 0 };
+              const up = (p.d || 0) >= 0;
               const isSel = state.selected === tk;
               const hasHigh = (newsByTicker[tk] || []).some(n => n.impact === "high");
               return (
@@ -680,7 +863,6 @@ export default function App() {
             {displayedTickers.length === 0 && <div className="text-xs opacity-40 italic px-3 py-4">No tickers in this group yet.</div>}
           </div>
 
-          {/* Cross-group note for custom tab */}
           {state.activeTab === "custom" && (
             <div className="mt-4 p-3 rounded-xl text-[11px] opacity-50 leading-relaxed" style={{ background: "#f7f7f3" }}>
               A ticker can belong to multiple Custom groups. Add it again in another group — it stays in both.
@@ -691,7 +873,6 @@ export default function App() {
         {/* ── MAIN ── */}
         <main className="col-span-9">
 
-          {/* ── FEED VIEW ── */}
           {view === "feed" && (
             <>
               <section className="rounded-2xl p-8 mb-6" style={{ background: "white", boxShadow: "0 1px 3px rgba(0,0,0,0.04), 0 0 0 1px #ececec" }}>
@@ -738,9 +919,7 @@ export default function App() {
 
               <section>
                 <div className="flex items-center justify-between mb-4 flex-wrap gap-3">
-                  <h3 className="font-serif-h text-2xl font-semibold">
-                    {activeGroups.find(g => g.id === state.activeGroup)?.name || "Headlines"}
-                  </h3>
+                  <h3 className="font-serif-h text-2xl font-semibold">{activeGroups.find(g => g.id === state.activeGroup)?.name || "Headlines"}</h3>
                   <div className="flex items-center gap-2">
                     <button onClick={() => setShowFilter(s => !s)}
                       className="flex items-center gap-1.5 text-xs px-3 py-1.5 rounded-full font-medium transition"
@@ -771,7 +950,7 @@ export default function App() {
                     <div className="flex flex-wrap gap-2">
                       {AVAILABLE_TAGS.map(tag => {
                         const active = activeTags.includes(tag);
-                        const style  = TAG_STYLES[tag];
+                        const style = TAG_STYLES[tag];
                         return (
                           <button key={tag} onClick={() => toggleTag(tag)}
                             className="text-xs px-3 py-1.5 rounded-full font-medium transition-all"
@@ -831,6 +1010,8 @@ export default function App() {
                               <span className="text-[11px] opacity-30">·</span>
                               <span className="text-[11px] opacity-50">{formatTimestamp(p.news.datetime)}</span>
                               <span className="text-[11px] opacity-30">·</span>
+                              <span className="text-[11px] opacity-50">{timeAgo(p.news.datetime)} ago</span>
+                              <span className="text-[11px] opacity-30">·</span>
                               <span className="text-[11px] opacity-50">pinned {days === 0 ? "today" : `${days}d ago`}</span>
                               {needsReview && (
                                 <span className="ml-auto text-[10px] font-semibold px-2 py-0.5 rounded-full flex items-center gap-1" style={{ background: "#fef3c7", color: "#92400e" }}>
@@ -858,82 +1039,65 @@ export default function App() {
             <section>
               <div className="mb-6">
                 <h2 className="font-serif-h text-3xl font-semibold mb-1">Watching</h2>
-                <p className="text-sm opacity-60">News alerts triggered by your keywords. Matches are saved automatically.</p>
+                <p className="text-sm opacity-60">Create cards to track new headlines matching your keywords. Only news published <em>after</em> a card is created counts.</p>
               </div>
 
-              {/* Keyword manager */}
+              {/* CREATE CARD */}
               <div className="rounded-2xl p-6 mb-6" style={{ background: "white", border: "1px solid #ececec" }}>
-                <div className="flex items-center justify-between mb-4">
-                  <div className="text-sm font-semibold">Alert keywords</div>
-                  <div className="text-xs opacity-50">{state.watchKeywords?.length || 0} active</div>
+                <div className="flex items-center gap-2 mb-4">
+                  <Plus size={14} className="opacity-50" />
+                  <div className="text-sm font-semibold">New watching card</div>
                 </div>
-                <div className="flex gap-2 mb-4">
-                  <input value={newKeyword} onChange={e => setNewKeyword(e.target.value)}
-                    onKeyDown={e => e.key === "Enter" && addKeyword()}
-                    placeholder="e.g. layoffs, FDA, earnings beat, acquisition…"
-                    className="flex-1 text-sm px-3 py-2 rounded-lg border focus:outline-none focus:border-gray-900 transition"
-                    style={{ borderColor: "#e5e5e5", background: "#fafaf7" }} />
-                  <button onClick={addKeyword} className="px-4 py-2 rounded-lg text-white text-sm font-medium" style={{ background: "#1a1a1a" }}>
-                    Add
-                  </button>
-                </div>
-                {state.watchKeywords?.length > 0 ? (
-                  <div className="flex flex-wrap gap-2">
-                    {state.watchKeywords.map(kw => (
-                      <div key={kw.id} className="flex items-center gap-1.5 px-3 py-1.5 rounded-full text-xs font-medium"
-                        style={{ background: "#f0f0ec", color: "#1a1a1a" }}>
-                        <Eye size={11} className="opacity-50" />
-                        {kw.keyword}
-                        <button onClick={() => removeKeyword(kw.id)} className="opacity-50 hover:opacity-100 ml-0.5"><X size={11} /></button>
-                      </div>
-                    ))}
+                <div className="grid grid-cols-12 gap-2">
+                  <div className="col-span-3">
+                    <label className="text-[10px] tracking-widest uppercase opacity-50 mb-1 block">Ticker</label>
+                    <input value={newCardTicker} onChange={e => setNewCardTicker(e.target.value.toUpperCase())}
+                      onKeyDown={e => e.key === "Enter" && createWatchCard()}
+                      placeholder="e.g. NVDA" className="w-full text-sm font-semibold px-3 py-2 rounded-lg border focus:outline-none focus:border-gray-900 transition"
+                      style={{ borderColor: "#e5e5e5", background: "#fafaf7" }} />
                   </div>
-                ) : (
-                  <p className="text-xs opacity-40 italic">No keywords yet. Add one above and any matching news from your watchlist will appear here automatically.</p>
-                )}
+                  <div className="col-span-7">
+                    <label className="text-[10px] tracking-widest uppercase opacity-50 mb-1 block">Keyword</label>
+                    <input value={newCardKeyword} onChange={e => setNewCardKeyword(e.target.value)}
+                      onKeyDown={e => e.key === "Enter" && createWatchCard()}
+                      placeholder="e.g. data center, FDA approval, lawsuit"
+                      className="w-full text-sm px-3 py-2 rounded-lg border focus:outline-none focus:border-gray-900 transition"
+                      style={{ borderColor: "#e5e5e5", background: "#fafaf7" }} />
+                  </div>
+                  <div className="col-span-2 flex items-end">
+                    <button onClick={createWatchCard}
+                      disabled={!newCardTicker.trim() || !newCardKeyword.trim()}
+                      className="w-full py-2 rounded-lg text-white text-sm font-medium transition disabled:opacity-30"
+                      style={{ background: "#1a1a1a" }}>
+                      Create
+                    </button>
+                  </div>
+                </div>
+                <p className="text-[11px] opacity-50 mt-3">
+                  Tip: keywords match anywhere in a headline or summary (case-insensitive). Use specific phrases to reduce noise.
+                </p>
               </div>
 
-              {/* Matches */}
-              {watchItems.length === 0 ? (
+              {/* CARDS */}
+              {sortedCards.length === 0 ? (
                 <div className="rounded-2xl p-12 text-center" style={{ background: "white", border: "1px solid #ececec" }}>
                   <Eye size={32} className="mx-auto opacity-20 mb-3" />
-                  <div className="text-sm opacity-60">No matches yet.</div>
-                  <div className="text-xs opacity-40 mt-1">Add keywords above. When news from your watchlist matches, it'll appear here.</div>
+                  <div className="text-sm opacity-60">No watching cards yet.</div>
+                  <div className="text-xs opacity-40 mt-1">Create one above. Each card watches a single ticker + keyword combination.</div>
                 </div>
               ) : (
                 <div className="space-y-3">
-                  {watchItems.map((m, idx) => {
-                    const matchId = Object.keys(state.watchMatches || {}).find(k => state.watchMatches[k] === m)
-                      || idx;
-                    return (
-                      <div key={matchId} className="rounded-xl p-5 fade-in"
-                        style={{ background: "white", border: "1px solid #d1fae5", boxShadow: "0 0 0 3px #ecfdf5" }}>
-                        <div className="flex items-start justify-between gap-4">
-                          <div className="flex-1">
-                            <div className="flex items-center gap-2 mb-2 flex-wrap">
-                              <span className="text-[10px] font-semibold px-2 py-0.5 rounded-full flex items-center gap-1"
-                                style={{ background: "#d1fae5", color: "#065f46" }}>
-                                <Eye size={9} /> {m.keyword}
-                              </span>
-                              <button onClick={() => { setSelected(m.ticker); setView("feed"); }}
-                                className="text-xs font-bold px-2 py-0.5 rounded-md" style={{ background: "#f0f0ec" }}>${m.ticker}</button>
-                              <span className="text-[11px] opacity-50">{m.news.source}</span>
-                              <span className="text-[11px] opacity-30">·</span>
-                              <span className="text-[11px] opacity-50">{formatTimestamp(m.news.datetime)}</span>
-                            </div>
-                            <a href={m.news.url} target="_blank" rel="noreferrer"
-                              className="font-serif-h text-lg font-semibold leading-snug mb-1 hover:underline block">
-                              {m.news.headline}
-                            </a>
-                            {m.news.summary && <p className="text-sm opacity-60 leading-relaxed">{m.news.summary}</p>}
-                          </div>
-                          <button onClick={() => removeWatchMatch(matchId)} className="flex-shrink-0 p-1.5 opacity-40 hover:opacity-100 transition hover:bg-gray-100 rounded-full">
-                            <X size={14} />
-                          </button>
-                        </div>
-                      </div>
-                    );
-                  })}
+                  {sortedCards.map(card => (
+                    <WatchingCard
+                      key={card.id}
+                      card={card}
+                      onToggleOpen={() => toggleCardOpen(card.id)}
+                      onDelete={() => requestDeleteCard(card.id, `$${card.ticker} · "${card.keyword}"`)}
+                      onMarkRead={(matchId) => markMatchRead(card.id, matchId)}
+                      onMarkAllRead={() => markAllRead(card.id)}
+                      onDismissMatch={(matchId) => dismissMatch(card.id, matchId)}
+                    />
+                  ))}
                 </div>
               )}
             </section>
@@ -950,4 +1114,3 @@ export default function App() {
     </div>
   );
 }
-
