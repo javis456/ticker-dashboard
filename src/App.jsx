@@ -52,6 +52,26 @@ function matchesKeyword(keyword, news) {
   return ((news.headline || "") + " " + (news.summary || "")).toLowerCase().includes(kw);
 }
 
+// Strip XML-style citation/source tags that may leak through from web search responses
+function stripTags(value) {
+  if (typeof value === "string") {
+    return value
+      .replace(/<cite\s+[^>]*>([\s\S]*?)<\/cite>/gi, "$1")
+      .replace(/<\/?cite[^>]*>/gi, "")
+      .replace(/<(source|ref|citation)\s+[^>]*>([\s\S]*?)<\/\1>/gi, "$2")
+      .replace(/<\/?(source|ref|citation)[^>]*>/gi, "")
+      .replace(/\s{2,}/g, " ")
+      .trim();
+  }
+  if (Array.isArray(value)) return value.map(stripTags);
+  if (value && typeof value === "object") {
+    const out = {};
+    for (const k of Object.keys(value)) out[k] = stripTags(value[k]);
+    return out;
+  }
+  return value;
+}
+
 // Period helpers for Summarize
 const PERIOD_OPTIONS = [
   { id: "1d", label: "1 day",     days: 1 },
@@ -322,7 +342,8 @@ function WatchingCard({ card, onToggleOpen, onDelete, onMarkRead, onMarkAllRead,
 
 // ─── Summary Card component ───────────────────────────────────────────────────
 function SummaryCard({ row, onDelete }) {
-  const s = row.data?.summary || {};
+  // stripTags cleans any XML citation/source tags that may have been saved in older summaries
+  const s = useMemo(() => stripTags(row.data?.summary || {}), [row.data]);
   const meta = row.data?.meta || {};
   const [expanded, setExpanded] = useState(false);
 
