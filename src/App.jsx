@@ -324,7 +324,7 @@ function WatchingCard({ card, onToggleOpen, onDelete, onMarkRead, onMarkAllRead,
 function SummaryCard({ row, onDelete }) {
   const s = row.data?.summary || {};
   const meta = row.data?.meta || {};
-  const [expanded, setExpanded] = useState(true);
+  const [expanded, setExpanded] = useState(false);
 
   const topicLabel = row.topic === "product"
     ? "Product focus"
@@ -1341,3 +1341,4 @@ export default function App() {
     </div>
   );
 }
+
