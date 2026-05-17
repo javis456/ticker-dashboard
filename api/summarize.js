@@ -1,5 +1,5 @@
 // Vercel serverless function: POST /api/summarize
-// Generates a structured summary for a ticker + period + topic using Claude Sonnet.
+// Generates a structured summary using Claude Sonnet.
 
 const SYSTEM_INSTRUCTIONS = `You are a financial news analyst writing a structured summary for a personal stock dashboard.
 
@@ -12,76 +12,135 @@ The JSON must follow this exact structure:
   "key_news": [
     {
       "headline": "Bold short title of the most important story",
-      "description": "2-3 sentence description capturing the main facts of this story",
+      "description": "2-3 sentence description capturing the main facts",
       "sources": [{"title": "Source name", "url": "https://..."}]
     }
   ],
   "sentiment": {
     "rating": "Bullish" | "Bearish" | "Mixed" | "Neutral",
-    "explanation": "2-3 sentences explaining the market sentiment during this period"
+    "explanation": "2-3 sentences explaining market sentiment"
   },
-  "price_performance": "Description of what happened to the price during this period, with explanation for the move if news supports it. 2-3 sentences.",
-  "future_predictions": [
-    "Specific prediction or expected action with timeline (e.g., 'Earnings report due May 22 — analysts watching data center segment growth')"
-  ],
-  "events_timeline": [
-    {"when": "May 22, 2026", "what": "Q1 earnings report"}
-  ],
+  "price_performance": "What happened to the price, with explanation. 2-3 sentences.",
+  "future_predictions": ["Specific prediction with timeline"],
+  "events_timeline": [{"when": "May 22, 2026", "what": "Q1 earnings report"}],
   "product_focus": null
 }
 
+CRITICAL LENGTH RULES — keep the JSON compact:
+- "key_news" should have 3-5 items max. Each "description" is 2-3 sentences ONLY.
+- "future_predictions" is 2-4 short bullets max
+- "events_timeline" is 2-5 entries max
+- "product_focus" (when filled) is 3-4 sentences, NOT a long essay
+- Be concise. Density over volume. Truncating beats overflowing.
+
 RULES:
-- Return 2-5 items in "key_news" — only genuinely important stories, not filler
 - Each key_news item MUST have at least one source link
-- "future_predictions" and "events_timeline" should only contain items grounded in the news. If none, return empty arrays.
-- If topic is "product", fill "product_focus" with a 3-5 sentence section specifically about product news.
-- If topic is custom, focus the analysis around the custom topic while still including all standard sections.
-- Be specific. No generic statements. Reference actual events.
-- NEVER fabricate URLs. Only use URLs that appear in the news provided or in web search results.
-- CRITICAL: Output must be parseable JSON. No trailing commas, no comments, no markdown.`;
+- If topic is "product", fill "product_focus". Otherwise null.
+- If topic is custom, tilt analysis toward the custom topic while keeping standard sections.
+- NEVER fabricate URLs. Only use URLs from the news provided or web search results.
+- Output must be parseable JSON. No trailing commas, no comments, no markdown fences.`;
 
 // ─── Robust JSON extraction ───────────────────────────────────────────────────
 function extractJSON(text) {
   if (!text) return null;
-
-  // Strategy 1: Try parsing as-is
   try { return JSON.parse(text.trim()); } catch {}
-
-  // Strategy 2: Strip markdown code fences if present
-  const fenceMatch = text.match(/```(?:json)?\s*([\s\S]*?)\s*```/);
-  if (fenceMatch) {
-    try { return JSON.parse(fenceMatch[1].trim()); } catch {}
-  }
-
-  // Strategy 3: Find the first { and match to its closing } using brace counting
+  const fence = text.match(/```(?:json)?\s*([\s\S]*?)\s*```/);
+  if (fence) { try { return JSON.parse(fence[1].trim()); } catch {} }
   const firstBrace = text.indexOf('{');
   if (firstBrace === -1) return null;
-
-  let depth = 0;
-  let inString = false;
-  let escape = false;
-
+  let depth = 0, inString = false, escape = false;
   for (let i = firstBrace; i < text.length; i++) {
     const c = text[i];
-
     if (escape) { escape = false; continue; }
     if (c === '\\') { escape = true; continue; }
     if (c === '"') { inString = !inString; continue; }
     if (inString) continue;
-
     if (c === '{') depth++;
     else if (c === '}') {
       depth--;
       if (depth === 0) {
-        const candidate = text.slice(firstBrace, i + 1);
-        try { return JSON.parse(candidate); } catch { return null; }
+        try { return JSON.parse(text.slice(firstBrace, i + 1)); } catch { return null; }
       }
     }
   }
-
   return null;
 }
 
+// ─── Salvage partial JSON when response was truncated ─────────────────────────
+// If the AI ran out of tokens mid-JSON, try to close it up.
+function salvageTruncatedJSON(text) {
+  if (!text) return null;
+  const firstBrace = text.indexOf('{');
+  if (firstBrace === -1) return null;
+  let s = text.slice(firstBrace);
+
+  // Walk forward, tracking depth, strings, escapes. Note where we stopped.
+  let depth = 0, inString = false, escape = false;
+  let lastSafeEnd = -1; // index after last position where structure is "safe to truncate"
+
+  for (let i = 0; i < s.length; i++) {
+    const c = s[i];
+    if (escape) { escape = false; continue; }
+    if (c === '\\') { escape = true; continue; }
+    if (c === '"') { inString = !inString; continue; }
+    if (inString) continue;
+    if (c === '{' || c === '[') depth++;
+    else if (c === '}' || c === ']') depth--;
+    // Safe point: after a comma at any depth, or after a closing brace at depth 1+
+    if (!inString && (c === ',' || c === '}' || c === ']')) {
+      lastSafeEnd = i + 1;
+    }
+  }
+
+  if (lastSafeEnd === -1) return null;
+
+  // Trim to last safe boundary, strip trailing comma, then close all open structures
+  let trimmed = s.slice(0, lastSafeEnd).replace(/,\s*$/, '');
+
+  // Count unclosed braces/brackets
+  let openBraces = 0, openBrackets = 0;
+  inString = false; escape = false;
+  for (const c of trimmed) {
+    if (escape) { escape = false; continue; }
+    if (c === '\\') { escape = true; continue; }
+    if (c === '"') { inString = !inString; continue; }
+    if (inString) continue;
+    if (c === '{') openBraces++;
+    else if (c === '}') openBraces--;
+    else if (c === '[') openBrackets++;
+    else if (c === ']') openBrackets--;
+  }
+
+  // Close brackets first (inner), then braces (outer)
+  while (openBrackets > 0) { trimmed += ']'; openBrackets--; }
+  while (openBraces   > 0) { trimmed += '}'; openBraces--;   }
+
+  try { return JSON.parse(trimmed); } catch { return null; }
+}
+
+// ─── Token budget planning ────────────────────────────────────────────────────
+function planTokenBudget(period, topic, newsCount) {
+  // Base budget
+  let budget = 2000;
+
+  // Longer periods → more news to discuss → more output
+  if (period === '1m')     budget += 800;
+  if (period === '1q')     budget += 1500;
+  if (period === 'custom') budget += 1500;
+
+  // Product topic adds a whole extra section
+  if (topic === 'product') budget += 800;
+  if (topic === 'custom')  budget += 500;
+
+  // More news items → more output
+  if (newsCount > 15) budget += 500;
+  if (newsCount > 25) budget += 500;
+
+  // Hard ceiling (Sonnet max_tokens limit is high, but we don't want to pay for runaway output)
+  return Math.min(budget, 6000);
+}
+
+// ─── Main handler ─────────────────────────────────────────────────────────────
 export default async function handler(req, res) {
   if (req.method !== 'POST') return res.status(405).json({ error: 'POST only' });
 
@@ -107,9 +166,9 @@ URL: ${n.url || 'N/A'}`
       ).join('\n\n');
 
   const topicHint = topic === 'product'
-    ? `Topic focus: PRODUCT — emphasize product launches, releases, milestones, achievements, customer wins. Fill "product_focus" in the JSON.`
+    ? `Topic focus: PRODUCT — emphasize product launches, milestones, achievements, customer wins. Fill "product_focus" (3-4 sentences max).`
     : topic === 'custom'
-      ? `Topic focus: CUSTOM — "${customTopic || 'general'}". Tilt the analysis around this topic while still covering all sections.`
+      ? `Topic focus: CUSTOM — "${customTopic || 'general'}". Tilt analysis around this topic while keeping all standard sections.`
       : 'Topic focus: OVERALL — cover all material developments.';
 
   const priceLine = priceContext && priceContext.startPx
@@ -118,18 +177,18 @@ URL: ${n.url || 'N/A'}`
 
   const enableWebSearch = ['1m', '1q', 'custom'].includes(period);
 
-  const userMessage = `Summarize ${ticker} for the period ${fromDate} to ${toDate} (${periodLabel}).
+  const userMessage = `Summarize ${ticker} for ${fromDate} to ${toDate} (${periodLabel}).
 
 ${topicHint}
 
 ${priceLine}
 
-News items from Finnhub for this period:
+News items from Finnhub:
 ${newsBlock}
 
-${enableWebSearch ? 'You may use web_search to find additional context if needed.' : 'Use only the news provided above.'}
+${enableWebSearch ? 'You may use web_search up to 3 times for additional context.' : 'Use only the news provided above.'}
 
-Now output the JSON summary. Remember: your response MUST be ONLY valid JSON, starting with { and ending with }.`;
+Output the JSON summary now. Be CONCISE — short descriptions, dense facts. Your response MUST start with { and end with }. No code fences.`;
 
   const tools = enableWebSearch ? [{
     type: 'web_search_20250305',
@@ -137,16 +196,14 @@ Now output the JSON summary. Remember: your response MUST be ONLY valid JSON, st
     max_uses: 3,
   }] : undefined;
 
+  const maxTokens = planTokenBudget(period, topic, newsItems.length);
+
   try {
     const body = {
       model: 'claude-sonnet-4-5-20250929',
-      max_tokens: 2500, // increased to avoid mid-JSON truncation
+      max_tokens: maxTokens,
       system: [
-        {
-          type: 'text',
-          text: SYSTEM_INSTRUCTIONS,
-          cache_control: { type: 'ephemeral' },
-        }
+        { type: 'text', text: SYSTEM_INSTRUCTIONS, cache_control: { type: 'ephemeral' } }
       ],
       messages: [{ role: 'user', content: userMessage }],
     };
@@ -169,21 +226,32 @@ Now output the JSON summary. Remember: your response MUST be ONLY valid JSON, st
     }
 
     const data = await response.json();
+    const stopReason = data.stop_reason; // "end_turn" | "max_tokens" | "tool_use" | ...
 
-    // Combine all text blocks (web search injects multiple blocks)
     const allText = data.content
       ?.filter(c => c.type === 'text')
       .map(c => c.text || '')
       .join('\n')
       .trim() || '';
 
-    // Robust extraction
-    const parsed = extractJSON(allText);
+    // Try clean parse first
+    let parsed = extractJSON(allText);
+
+    // If clean parse failed AND response was truncated, try to salvage
+    let wasSalvaged = false;
+    if (!parsed && stopReason === 'max_tokens') {
+      parsed = salvageTruncatedJSON(allText);
+      if (parsed) wasSalvaged = true;
+    }
 
     if (!parsed) {
-      console.error('JSON extraction failed. Raw text:', allText.slice(0, 500));
+      console.error('JSON extraction failed. stop_reason:', stopReason, 'Raw preview:', allText.slice(0, 800));
       return res.status(502).json({
-        error: 'Could not parse summary response',
+        error: stopReason === 'max_tokens'
+          ? `Response exceeded token budget (${maxTokens}). Try a shorter period or simpler topic.`
+          : 'Could not parse summary response',
+        stopReason,
+        maxTokensUsed: maxTokens,
         rawPreview: allText.slice(0, 1000),
       });
     }
@@ -209,6 +277,9 @@ Now output the JSON summary. Remember: your response MUST be ONLY valid JSON, st
         tokens:    { input: inputTokens, cached: cachedInputTokens, output: outputTokens, cacheCreate: cacheCreateTokens },
         searches:  searchUses,
         costUSD:   Number(totalCost.toFixed(4)),
+        stopReason,
+        maxTokensUsed: maxTokens,
+        salvaged:  wasSalvaged,
       }
     });
   } catch (e) {
@@ -216,3 +287,4 @@ Now output the JSON summary. Remember: your response MUST be ONLY valid JSON, st
     res.status(500).json({ error: String(e.message || e) });
   }
 }
+
