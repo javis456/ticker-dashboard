@@ -1,26 +1,11 @@
 // Vercel serverless function: POST /api/summarize
 // Generates a structured summary for a ticker + period + topic using Claude Sonnet.
-// Cost-optimized:
-//  - prompt caching on the static instructions (90% discount on cached input tokens)
-//  - web_search only enabled for periods >= 1 month (Finnhub usually has enough for shorter)
-//  - max_tokens capped at 1500
-//
-// Input body:
-// {
-//   ticker:  "AMD",
-//   period:  "1d" | "1w" | "1m" | "1q" | "custom",
-//   periodLabel: "1 week",
-//   fromDate: "2026-05-08",  // ISO date string
-//   toDate:   "2026-05-15",
-//   topic:    "overall" | "product" | "custom",
-//   customTopic: "",            // when topic === "custom"
-//   priceContext: { startPx, endPx, pctChange, high, low },
-//   newsItems: [{ headline, source, datetime, url, summary }]  // pre-filtered to period
-// }
 
 const SYSTEM_INSTRUCTIONS = `You are a financial news analyst writing a structured summary for a personal stock dashboard.
 
-OUTPUT FORMAT — strict JSON, no preamble, no markdown fences:
+OUTPUT FORMAT — return ONLY a valid JSON object, nothing else. No preamble, no markdown code fences, no explanation. The very first character of your response must be { and the very last must be }.
+
+The JSON must follow this exact structure:
 
 {
   "headline_summary": "One-line tl;dr of the period (max 20 words)",
@@ -37,23 +22,65 @@ OUTPUT FORMAT — strict JSON, no preamble, no markdown fences:
   },
   "price_performance": "Description of what happened to the price during this period, with explanation for the move if news supports it. 2-3 sentences.",
   "future_predictions": [
-    "Specific prediction or expected action with timeline, derived from news context (e.g., 'Earnings report due May 22 — analysts watching data center segment growth')"
+    "Specific prediction or expected action with timeline (e.g., 'Earnings report due May 22 — analysts watching data center segment growth')"
   ],
   "events_timeline": [
-    {"when": "May 22, 2026", "what": "Q1 earnings report"},
-    {"when": "Next 3 weeks", "what": "Neutron rocket launch (per Reuters)"}
+    {"when": "May 22, 2026", "what": "Q1 earnings report"}
   ],
   "product_focus": null
 }
 
 RULES:
 - Return 2-5 items in "key_news" — only genuinely important stories, not filler
-- Each key_news item MUST have at least one source link from the news provided
-- "future_predictions" and "events_timeline" should only contain items grounded in the news. If no clear future events are mentioned, return empty arrays.
-- If topic is "product", also fill "product_focus" with a 3-5 sentence section specifically about product news (launches, updates, milestones, achievements). Otherwise leave it null.
+- Each key_news item MUST have at least one source link
+- "future_predictions" and "events_timeline" should only contain items grounded in the news. If none, return empty arrays.
+- If topic is "product", fill "product_focus" with a 3-5 sentence section specifically about product news.
 - If topic is custom, focus the analysis around the custom topic while still including all standard sections.
-- Be specific. No generic statements like "the stock had a volatile week." Reference actual events.
-- NEVER fabricate URLs. Only use URLs that appear in the news provided or in your web search results.`;
+- Be specific. No generic statements. Reference actual events.
+- NEVER fabricate URLs. Only use URLs that appear in the news provided or in web search results.
+- CRITICAL: Output must be parseable JSON. No trailing commas, no comments, no markdown.`;
+
+// ─── Robust JSON extraction ───────────────────────────────────────────────────
+function extractJSON(text) {
+  if (!text) return null;
+
+  // Strategy 1: Try parsing as-is
+  try { return JSON.parse(text.trim()); } catch {}
+
+  // Strategy 2: Strip markdown code fences if present
+  const fenceMatch = text.match(/```(?:json)?\s*([\s\S]*?)\s*```/);
+  if (fenceMatch) {
+    try { return JSON.parse(fenceMatch[1].trim()); } catch {}
+  }
+
+  // Strategy 3: Find the first { and match to its closing } using brace counting
+  const firstBrace = text.indexOf('{');
+  if (firstBrace === -1) return null;
+
+  let depth = 0;
+  let inString = false;
+  let escape = false;
+
+  for (let i = firstBrace; i < text.length; i++) {
+    const c = text[i];
+
+    if (escape) { escape = false; continue; }
+    if (c === '\\') { escape = true; continue; }
+    if (c === '"') { inString = !inString; continue; }
+    if (inString) continue;
+
+    if (c === '{') depth++;
+    else if (c === '}') {
+      depth--;
+      if (depth === 0) {
+        const candidate = text.slice(firstBrace, i + 1);
+        try { return JSON.parse(candidate); } catch { return null; }
+      }
+    }
+  }
+
+  return null;
+}
 
 export default async function handler(req, res) {
   if (req.method !== 'POST') return res.status(405).json({ error: 'POST only' });
@@ -70,7 +97,6 @@ export default async function handler(req, res) {
     return res.status(400).json({ error: 'ticker, period, fromDate, toDate required' });
   }
 
-  // Format news for the prompt
   const newsBlock = newsItems.length === 0
     ? "(No news items provided from Finnhub for this period.)"
     : newsItems.slice(0, 25).map((n, i) =>
@@ -90,8 +116,6 @@ URL: ${n.url || 'N/A'}`
     ? `Price context: started at $${priceContext.startPx?.toFixed(2)}, ended at $${priceContext.endPx?.toFixed(2)} (${priceContext.pctChange > 0 ? '+' : ''}${priceContext.pctChange?.toFixed(2)}%). High: $${priceContext.high?.toFixed(2)}, Low: $${priceContext.low?.toFixed(2)}.`
     : 'Price context: unavailable.';
 
-  // Web search only for longer periods (cost optimization)
-  // For 1d / 1w, Finnhub data is usually sufficient
   const enableWebSearch = ['1m', '1q', 'custom'].includes(period);
 
   const userMessage = `Summarize ${ticker} for the period ${fromDate} to ${toDate} (${periodLabel}).
@@ -103,25 +127,25 @@ ${priceLine}
 News items from Finnhub for this period:
 ${newsBlock}
 
-${enableWebSearch ? 'You may also use web_search to find additional context if the news above is insufficient (especially for older periods).' : 'Use only the news provided above.'}
+${enableWebSearch ? 'You may use web_search to find additional context if needed.' : 'Use only the news provided above.'}
 
-Return the JSON summary now.`;
+Now output the JSON summary. Remember: your response MUST be ONLY valid JSON, starting with { and ending with }.`;
 
   const tools = enableWebSearch ? [{
     type: 'web_search_20250305',
     name: 'web_search',
-    max_uses: 3, // Hard cap on searches per summary
+    max_uses: 3,
   }] : undefined;
 
   try {
     const body = {
       model: 'claude-sonnet-4-5-20250929',
-      max_tokens: 1500,
+      max_tokens: 2500, // increased to avoid mid-JSON truncation
       system: [
         {
           type: 'text',
           text: SYSTEM_INSTRUCTIONS,
-          cache_control: { type: 'ephemeral' }, // 90% discount on repeated calls
+          cache_control: { type: 'ephemeral' },
         }
       ],
       messages: [{ role: 'user', content: userMessage }],
@@ -141,27 +165,27 @@ Return the JSON summary now.`;
     if (!response.ok) {
       const errText = await response.text();
       console.error('Anthropic error:', response.status, errText);
-      return res.status(502).json({ error: 'Summary generation failed', details: errText });
+      return res.status(502).json({ error: 'Anthropic API call failed', details: errText });
     }
 
     const data = await response.json();
 
-    // Combine all text blocks (web search may inject multiple)
-    const text = data.content
+    // Combine all text blocks (web search injects multiple blocks)
+    const allText = data.content
       ?.filter(c => c.type === 'text')
       .map(c => c.text || '')
-      .join('')
+      .join('\n')
       .trim() || '';
 
-    // Strip code fences if present
-    const clean = text.replace(/^```(?:json)?\s*/i, '').replace(/```\s*$/, '').trim();
+    // Robust extraction
+    const parsed = extractJSON(allText);
 
-    let parsed;
-    try {
-      parsed = JSON.parse(clean);
-    } catch (e) {
-      console.error('JSON parse failed:', text);
-      return res.status(502).json({ error: 'Could not parse summary response', raw: text });
+    if (!parsed) {
+      console.error('JSON extraction failed. Raw text:', allText.slice(0, 500));
+      return res.status(502).json({
+        error: 'Could not parse summary response',
+        rawPreview: allText.slice(0, 1000),
+      });
     }
 
     // Cost reporting
@@ -172,13 +196,12 @@ Return the JSON summary now.`;
     const outputTokens        = usage.output_tokens || 0;
     const searchUses          = data.content?.filter(c => c.type === 'server_tool_use').length || 0;
 
-    // Sonnet 4.5 pricing
-    const inputCost     = (inputTokens / 1_000_000) * 3.0;
-    const cachedCost    = (cachedInputTokens / 1_000_000) * 0.30;
+    const inputCost       = (inputTokens / 1_000_000) * 3.0;
+    const cachedCost      = (cachedInputTokens / 1_000_000) * 0.30;
     const cacheCreateCost = (cacheCreateTokens / 1_000_000) * 3.75;
-    const outputCost    = (outputTokens / 1_000_000) * 15.0;
-    const searchCost    = searchUses * 0.01;
-    const totalCost     = inputCost + cachedCost + cacheCreateCost + outputCost + searchCost;
+    const outputCost      = (outputTokens / 1_000_000) * 15.0;
+    const searchCost      = searchUses * 0.01;
+    const totalCost       = inputCost + cachedCost + cacheCreateCost + outputCost + searchCost;
 
     res.status(200).json({
       summary: parsed,
@@ -189,7 +212,7 @@ Return the JSON summary now.`;
       }
     });
   } catch (e) {
-    console.error(e);
+    console.error('Handler error:', e);
     res.status(500).json({ error: String(e.message || e) });
   }
 }
