@@ -31,14 +31,45 @@ CRITICAL LENGTH RULES — keep the JSON compact:
 - "future_predictions" is 2-4 short bullets max
 - "events_timeline" is 2-5 entries max
 - "product_focus" (when filled) is 3-4 sentences, NOT a long essay
-- Be concise. Density over volume. Truncating beats overflowing.
+- Be concise. Density over volume.
+
+CRITICAL FORMATTING RULES:
+- DO NOT include any XML or HTML tags inside string values (no <cite>, <source>, <ref>, etc.)
+- DO NOT wrap text in citation markers — sources go in the "sources" array only
+- Plain text only inside string values
+- NEVER fabricate URLs. Only use URLs from the news provided or web search results.
 
 RULES:
 - Each key_news item MUST have at least one source link
 - If topic is "product", fill "product_focus". Otherwise null.
 - If topic is custom, tilt analysis toward the custom topic while keeping standard sections.
-- NEVER fabricate URLs. Only use URLs from the news provided or web search results.
 - Output must be parseable JSON. No trailing commas, no comments, no markdown fences.`;
+
+// ─── Strip citation/source XML tags from any string value in the parsed JSON ──
+// Claude's web search sometimes wraps claims with <cite index="..."> tags.
+// We want to keep the claim text but drop the tags entirely.
+function cleanCitations(value) {
+  if (typeof value === 'string') {
+    return value
+      // Remove <cite index="...">text</cite> wrappers, keep inner text
+      .replace(/<cite\s+[^>]*>([\s\S]*?)<\/cite>/gi, '$1')
+      // Remove any orphan <cite ...> opening or </cite> closing tags
+      .replace(/<\/?cite[^>]*>/gi, '')
+      // Same defensive treatment for <source>, <ref>, <citation> if they ever appear
+      .replace(/<(source|ref|citation)\s+[^>]*>([\s\S]*?)<\/\1>/gi, '$2')
+      .replace(/<\/?(source|ref|citation)[^>]*>/gi, '')
+      // Collapse any double spaces left behind
+      .replace(/\s{2,}/g, ' ')
+      .trim();
+  }
+  if (Array.isArray(value)) return value.map(cleanCitations);
+  if (value && typeof value === 'object') {
+    const out = {};
+    for (const k of Object.keys(value)) out[k] = cleanCitations(value[k]);
+    return out;
+  }
+  return value;
+}
 
 // ─── Robust JSON extraction ───────────────────────────────────────────────────
 function extractJSON(text) {
@@ -67,17 +98,14 @@ function extractJSON(text) {
 }
 
 // ─── Salvage partial JSON when response was truncated ─────────────────────────
-// If the AI ran out of tokens mid-JSON, try to close it up.
 function salvageTruncatedJSON(text) {
   if (!text) return null;
   const firstBrace = text.indexOf('{');
   if (firstBrace === -1) return null;
   let s = text.slice(firstBrace);
 
-  // Walk forward, tracking depth, strings, escapes. Note where we stopped.
   let depth = 0, inString = false, escape = false;
-  let lastSafeEnd = -1; // index after last position where structure is "safe to truncate"
-
+  let lastSafeEnd = -1;
   for (let i = 0; i < s.length; i++) {
     const c = s[i];
     if (escape) { escape = false; continue; }
@@ -86,18 +114,12 @@ function salvageTruncatedJSON(text) {
     if (inString) continue;
     if (c === '{' || c === '[') depth++;
     else if (c === '}' || c === ']') depth--;
-    // Safe point: after a comma at any depth, or after a closing brace at depth 1+
-    if (!inString && (c === ',' || c === '}' || c === ']')) {
-      lastSafeEnd = i + 1;
-    }
+    if (!inString && (c === ',' || c === '}' || c === ']')) lastSafeEnd = i + 1;
   }
 
   if (lastSafeEnd === -1) return null;
-
-  // Trim to last safe boundary, strip trailing comma, then close all open structures
   let trimmed = s.slice(0, lastSafeEnd).replace(/,\s*$/, '');
 
-  // Count unclosed braces/brackets
   let openBraces = 0, openBrackets = 0;
   inString = false; escape = false;
   for (const c of trimmed) {
@@ -110,8 +132,6 @@ function salvageTruncatedJSON(text) {
     else if (c === '[') openBrackets++;
     else if (c === ']') openBrackets--;
   }
-
-  // Close brackets first (inner), then braces (outer)
   while (openBrackets > 0) { trimmed += ']'; openBrackets--; }
   while (openBraces   > 0) { trimmed += '}'; openBraces--;   }
 
@@ -120,23 +140,14 @@ function salvageTruncatedJSON(text) {
 
 // ─── Token budget planning ────────────────────────────────────────────────────
 function planTokenBudget(period, topic, newsCount) {
-  // Base budget
   let budget = 2000;
-
-  // Longer periods → more news to discuss → more output
   if (period === '1m')     budget += 800;
   if (period === '1q')     budget += 1500;
   if (period === 'custom') budget += 1500;
-
-  // Product topic adds a whole extra section
   if (topic === 'product') budget += 800;
   if (topic === 'custom')  budget += 500;
-
-  // More news items → more output
   if (newsCount > 15) budget += 500;
   if (newsCount > 25) budget += 500;
-
-  // Hard ceiling (Sonnet max_tokens limit is high, but we don't want to pay for runaway output)
   return Math.min(budget, 6000);
 }
 
@@ -188,7 +199,7 @@ ${newsBlock}
 
 ${enableWebSearch ? 'You may use web_search up to 3 times for additional context.' : 'Use only the news provided above.'}
 
-Output the JSON summary now. Be CONCISE — short descriptions, dense facts. Your response MUST start with { and end with }. No code fences.`;
+Output the JSON summary now. Be CONCISE — short descriptions, dense facts. Your response MUST start with { and end with }. No code fences. NO XML tags inside string values.`;
 
   const tools = enableWebSearch ? [{
     type: 'web_search_20250305',
@@ -226,7 +237,7 @@ Output the JSON summary now. Be CONCISE — short descriptions, dense facts. You
     }
 
     const data = await response.json();
-    const stopReason = data.stop_reason; // "end_turn" | "max_tokens" | "tool_use" | ...
+    const stopReason = data.stop_reason;
 
     const allText = data.content
       ?.filter(c => c.type === 'text')
@@ -234,10 +245,7 @@ Output the JSON summary now. Be CONCISE — short descriptions, dense facts. You
       .join('\n')
       .trim() || '';
 
-    // Try clean parse first
     let parsed = extractJSON(allText);
-
-    // If clean parse failed AND response was truncated, try to salvage
     let wasSalvaged = false;
     if (!parsed && stopReason === 'max_tokens') {
       parsed = salvageTruncatedJSON(allText);
@@ -245,7 +253,7 @@ Output the JSON summary now. Be CONCISE — short descriptions, dense facts. You
     }
 
     if (!parsed) {
-      console.error('JSON extraction failed. stop_reason:', stopReason, 'Raw preview:', allText.slice(0, 800));
+      console.error('JSON extraction failed. stop_reason:', stopReason, 'Raw:', allText.slice(0, 800));
       return res.status(502).json({
         error: stopReason === 'max_tokens'
           ? `Response exceeded token budget (${maxTokens}). Try a shorter period or simpler topic.`
@@ -256,7 +264,9 @@ Output the JSON summary now. Be CONCISE — short descriptions, dense facts. You
       });
     }
 
-    // Cost reporting
+    // Strip citation/source XML tags from all string values
+    parsed = cleanCitations(parsed);
+
     const usage = data.usage || {};
     const inputTokens         = usage.input_tokens || 0;
     const cachedInputTokens   = usage.cache_read_input_tokens || 0;
@@ -287,4 +297,3 @@ Output the JSON summary now. Be CONCISE — short descriptions, dense facts. You
     res.status(500).json({ error: String(e.message || e) });
   }
 }
-
