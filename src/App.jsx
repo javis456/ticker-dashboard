@@ -3,13 +3,15 @@ import {
   TrendingUp, TrendingDown, Plus, X, Star, Bookmark, Search, FolderPlus,
   ChevronRight, ChevronDown, Bell, RefreshCw, ExternalLink, Cloud, CloudOff,
   Copy, Check, Sparkles, Filter, Eye, Trash2, AlertCircle, Tag, Layers,
-  CheckCheck, FileText, Calendar, Target, TrendingUpIcon, Zap, Clock
+  CheckCheck, FileText, Calendar, Target, TrendingUpIcon, Zap, Clock,
+  BellRing, Mail, DollarSign, AlertCircle as AlertCircleIcon, Power
 } from "lucide-react";
 import { AreaChart, Area, XAxis, YAxis, Tooltip, ResponsiveContainer } from "recharts";
 import { getQuote, getProfile, getNews, getCandles, classifyImpact, timeAgo } from "./lib/finnhub";
 import { supabase, getIdentity, setIdentity, loadState, saveState } from "./lib/supabase";
 import { tagNews, AVAILABLE_TAGS, TAG_STYLES } from "./lib/tagger";
 import { loadSummaries, saveSummary, deleteSummary, generateSummary } from "./lib/summaries";
+import { loadUserEmail, saveUserEmail, loadAlerts, createAlert, stopAlert, deleteAlert } from "./lib/alerts";
 
 const DEFAULT_STATE = {
   sectorGroups: [
@@ -548,10 +550,26 @@ export default function App() {
   const [generatingSummary, setGeneratingSummary] = useState(false);
   const [summaryError, setSummaryError] = useState(null);
 
+  // ── Price Alerts state ──────────────────────────────────────────────────────
+  const [alerts, setAlerts] = useState([]);
+  const [userEmail, setUserEmail] = useState("");
+  const [emailDraft, setEmailDraft] = useState("");
+  const [emailSaved, setEmailSaved] = useState(false);
+  const [newAlertTicker, setNewAlertTicker] = useState("");
+  const [newAlertPrice,  setNewAlertPrice]  = useState("");
+  const [newAlertNotes,  setNewAlertNotes]  = useState("");
+  const [alertError, setAlertError] = useState(null);
+  const [creatingAlert, setCreatingAlert] = useState(false);
+
   const totalUnread = useMemo(
     () => (state.watchCards || []).reduce((sum, c) => sum + c.matches.filter(m => !m.isRead).length, 0),
     [state.watchCards]
   );
+
+  // Alerts that fired but user hasn't acknowledged (status = 'triggered')
+  const triggeredAlerts = useMemo(() => alerts.filter(a => a.status === 'triggered'), [alerts]);
+  const activeAlerts    = useMemo(() => alerts.filter(a => a.status === 'active'),    [alerts]);
+  const stoppedAlerts   = useMemo(() => alerts.filter(a => a.status === 'stopped'),   [alerts]);
 
   useEffect(() => {
     document.title = totalUnread > 0 ? `(${totalUnread}) Ticker · alerts` : "Ticker — Your market, distilled";
@@ -577,6 +595,11 @@ export default function App() {
         }
         const loaded = await loadSummaries();
         setSummaries(loaded);
+        const a = await loadAlerts();
+        setAlerts(a);
+        const em = await loadUserEmail();
+        setUserEmail(em);
+        setEmailDraft(em);
         setCloudStatus("synced");
       } catch { setCloudStatus("offline"); }
       setHydrated(true);
@@ -629,6 +652,13 @@ export default function App() {
     }, 60_000);
     return () => clearInterval(id);
   }, [hydrated, allTickers]);
+
+  // Refresh alerts from DB every 60s so we see triggered status from the cron job
+  useEffect(() => {
+    if (!hydrated) return;
+    const id = setInterval(() => { loadAlerts().then(setAlerts).catch(() => {}); }, 60_000);
+    return () => clearInterval(id);
+  }, [hydrated]);
 
   useEffect(() => {
     if (!hydrated) return;
@@ -775,6 +805,10 @@ export default function App() {
       const id = confirmDelete.id;
       setSummaries(prev => prev.filter(r => r.id !== id));
       await deleteSummary(id);
+    } else if (confirmDelete.type === "alert") {
+      const id = confirmDelete.id;
+      setAlerts(prev => prev.filter(a => a.id !== id));
+      await deleteAlert(id);
     }
     setConfirmDelete(null);
   };
@@ -793,6 +827,60 @@ export default function App() {
   const markMatchRead = (cardId, matchId) => updateState(s => ({ ...s, watchCards: s.watchCards.map(c => c.id !== cardId ? c : { ...c, matches: c.matches.map(m => m.id === matchId ? { ...m, isRead: true } : m) }) }));
   const markAllRead = cardId => updateState(s => ({ ...s, watchCards: s.watchCards.map(c => c.id !== cardId ? c : { ...c, matches: c.matches.map(m => ({ ...m, isRead: true })) }) }));
   const dismissMatch = (cardId, matchId) => updateState(s => ({ ...s, watchCards: s.watchCards.map(c => c.id !== cardId ? c : { ...c, matches: c.matches.filter(m => m.id !== matchId) }) }));
+
+  // ── Price Alerts: create / stop / delete / email ───────────────────────────
+  const saveEmail = async () => {
+    const e = (emailDraft || "").trim();
+    if (!e || !/^\S+@\S+\.\S+$/.test(e)) {
+      setAlertError("Please enter a valid email address.");
+      return;
+    }
+    await saveUserEmail(e);
+    setUserEmail(e);
+    setEmailSaved(true);
+    setAlertError(null);
+    setTimeout(() => setEmailSaved(false), 2000);
+  };
+
+  const createPriceAlert = async () => {
+    setAlertError(null);
+    const tk = newAlertTicker.trim().toUpperCase();
+    const target = parseFloat(newAlertPrice);
+    if (!tk) { setAlertError("Please enter a ticker"); return; }
+    if (!target || target <= 0) { setAlertError("Please enter a valid target price"); return; }
+    if (!userEmail) { setAlertError("Please set your email above first"); return; }
+
+    setCreatingAlert(true);
+    try {
+      // Need current price as "start price" — fetch fresh
+      let startPrice = quotes[tk]?.c;
+      if (!startPrice) {
+        const q = await getQuote(tk).catch(() => null);
+        startPrice = q?.c;
+      }
+      if (!startPrice) {
+        setAlertError(`Could not fetch current price for ${tk}. Check the ticker symbol.`);
+        return;
+      }
+      const row = await createAlert({ ticker: tk, targetPrice: target, startPrice, notes: newAlertNotes });
+      if (row) {
+        setAlerts(prev => [row, ...prev]);
+        setNewAlertTicker(""); setNewAlertPrice(""); setNewAlertNotes("");
+        if (!quotes[tk]) loadTicker(tk);
+      } else {
+        setAlertError("Failed to create alert. Try again.");
+      }
+    } finally {
+      setCreatingAlert(false);
+    }
+  };
+
+  const handleStopAlert = async (id) => {
+    await stopAlert(id);
+    setAlerts(prev => prev.map(a => a.id === id ? { ...a, status: 'stopped' } : a));
+  };
+
+  const requestDeleteAlert = (id, ticker) => setConfirmDelete({ type: "alert", id, label: `alert on $${ticker}` });
 
   // ── Summarize: generate ─────────────────────────────────────────────────────
   const runSummary = async () => {
@@ -918,6 +1006,7 @@ export default function App() {
                 { id: "pinned",    label: "Pinned",    badge: pinnedItems.length },
                 { id: "watching",  label: "Watching",  badge: totalUnread, badgeColor: "#059669" },
                 { id: "summarize", label: "Summarize", badge: summaries.length, badgeColor: "#7c3aed" },
+                { id: "alerts",    label: "Alerts",    badge: triggeredAlerts.length, badgeColor: "#dc2626" },
               ].map(tab => (
                 <button key={tab.id} onClick={() => setView(tab.id)} className="px-3 py-1.5 text-sm rounded-full transition-all flex items-center gap-1.5"
                   style={{ background: view === tab.id ? "#1a1a1a" : "transparent", color: view === tab.id ? "#fafaf7" : "#1a1a1a" }}>
@@ -958,6 +1047,7 @@ export default function App() {
             confirmDelete.type === "ticker"  ? `${confirmDelete.label} will be removed from all groups. Pinned news and watching cards using this ticker are kept.` :
             confirmDelete.type === "group"   ? `The group ${confirmDelete.label} will be deleted. Tickers inside are not deleted — they remain in other groups.` :
             confirmDelete.type === "card"    ? `The watching card ${confirmDelete.label} and all its saved matches will be permanently removed.` :
+            confirmDelete.type === "alert"   ? `The ${confirmDelete.label} will be permanently removed.` :
                                                `This ${confirmDelete.label} will be permanently removed. This action cannot be undone.`
           }
           onConfirm={executeDelete} onCancel={() => setConfirmDelete(null)} />
@@ -1350,6 +1440,206 @@ export default function App() {
               )}
             </section>
           )}
+
+          {/* ── ALERTS VIEW ── */}
+          {view === "alerts" && (
+            <section>
+              <div className="mb-6">
+                <h2 className="font-serif-h text-3xl font-semibold mb-1">Price Alerts</h2>
+                <p className="text-sm opacity-60">Get an email when a stock hits your target price. Alerts fire one-time during US market hours (Mon–Fri, 9:30 AM – 4:00 PM ET).</p>
+              </div>
+
+              {/* Email setup */}
+              <div className="rounded-2xl p-6 mb-6" style={{ background: "white", border: "1px solid #ececec" }}>
+                <div className="flex items-center gap-2 mb-3">
+                  <Mail size={14} className="opacity-50" />
+                  <div className="text-sm font-semibold">Alert email</div>
+                  {!userEmail && (
+                    <span className="text-[10px] font-bold uppercase tracking-wider px-2 py-0.5 rounded-full" style={{ background: "#fee2e2", color: "#991b1b" }}>
+                      Required
+                    </span>
+                  )}
+                </div>
+                <div className="flex gap-2">
+                  <input type="email" value={emailDraft} onChange={e => setEmailDraft(e.target.value)}
+                    placeholder="you@example.com"
+                    className="flex-1 text-sm px-3 py-2 rounded-lg border focus:outline-none focus:border-gray-900 transition"
+                    style={{ borderColor: "#e5e5e5", background: "#fafaf7" }} />
+                  <button onClick={saveEmail} disabled={emailDraft === userEmail && !!userEmail}
+                    className="px-4 py-2 rounded-lg text-white text-sm font-medium transition disabled:opacity-30 flex items-center gap-1"
+                    style={{ background: emailSaved ? "#059669" : "#1a1a1a" }}>
+                    {emailSaved ? <><Check size={12} /> Saved</> : "Save"}
+                  </button>
+                </div>
+                {userEmail && (
+                  <p className="text-[11px] opacity-50 mt-2">
+                    Emails go to <b>{userEmail}</b>. Update anytime — only the saved email receives alerts.
+                  </p>
+                )}
+              </div>
+
+              {/* Alert creator */}
+              <div className="rounded-2xl p-6 mb-6" style={{ background: "white", border: "1px solid #ececec" }}>
+                <div className="flex items-center gap-2 mb-4">
+                  <BellRing size={14} className="opacity-50" />
+                  <div className="text-sm font-semibold">New price alert</div>
+                </div>
+                <div className="grid grid-cols-12 gap-2">
+                  <div className="col-span-3">
+                    <label className="text-[10px] tracking-widest uppercase opacity-50 mb-1 block">Ticker</label>
+                    <input value={newAlertTicker} onChange={e => setNewAlertTicker(e.target.value.toUpperCase())}
+                      onKeyDown={e => e.key === "Enter" && createPriceAlert()}
+                      placeholder="e.g. AMD"
+                      className="w-full text-sm font-semibold px-3 py-2 rounded-lg border focus:outline-none focus:border-gray-900 transition"
+                      style={{ borderColor: "#e5e5e5", background: "#fafaf7" }} />
+                  </div>
+                  <div className="col-span-3">
+                    <label className="text-[10px] tracking-widest uppercase opacity-50 mb-1 block">Target price</label>
+                    <div className="relative">
+                      <span className="absolute left-3 top-1/2 -translate-y-1/2 text-sm opacity-50">$</span>
+                      <input type="number" step="0.01" value={newAlertPrice} onChange={e => setNewAlertPrice(e.target.value)}
+                        onKeyDown={e => e.key === "Enter" && createPriceAlert()}
+                        placeholder="200.00"
+                        className="w-full text-sm font-semibold pl-7 pr-3 py-2 rounded-lg border focus:outline-none focus:border-gray-900 transition"
+                        style={{ borderColor: "#e5e5e5", background: "#fafaf7" }} />
+                    </div>
+                  </div>
+                  <div className="col-span-4">
+                    <label className="text-[10px] tracking-widest uppercase opacity-50 mb-1 block">Note (optional)</label>
+                    <input value={newAlertNotes} onChange={e => setNewAlertNotes(e.target.value)}
+                      onKeyDown={e => e.key === "Enter" && createPriceAlert()}
+                      placeholder="e.g. Buy zone, Sell trigger"
+                      className="w-full text-sm px-3 py-2 rounded-lg border focus:outline-none focus:border-gray-900 transition"
+                      style={{ borderColor: "#e5e5e5", background: "#fafaf7" }} />
+                  </div>
+                  <div className="col-span-2 flex items-end">
+                    <button onClick={createPriceAlert}
+                      disabled={creatingAlert || !newAlertTicker.trim() || !newAlertPrice || !userEmail}
+                      className="w-full py-2 rounded-lg text-white text-sm font-medium transition disabled:opacity-30 flex items-center justify-center gap-1"
+                      style={{ background: "#1a1a1a" }}>
+                      {creatingAlert ? <><RefreshCw size={11} className="animate-spin" /></> : <><BellRing size={11} /> Alert</>}
+                    </button>
+                  </div>
+                  {alertError && (
+                    <div className="col-span-12 text-xs px-3 py-2 rounded-lg" style={{ background: "#fee2e2", color: "#991b1b" }}>
+                      {alertError}
+                    </div>
+                  )}
+                  <p className="col-span-12 text-[11px] opacity-50 mt-1">
+                    Crosses either direction — if the price climbs to your target from below, or drops to it from above, you'll get an email.
+                  </p>
+                </div>
+              </div>
+
+              {/* Alert cards: triggered first, then active, then stopped */}
+              {alerts.length === 0 ? (
+                <div className="rounded-2xl p-12 text-center" style={{ background: "white", border: "1px solid #ececec" }}>
+                  <BellRing size={32} className="mx-auto opacity-20 mb-3" />
+                  <div className="text-sm opacity-60">No price alerts yet.</div>
+                  <div className="text-xs opacity-40 mt-1">Create one above. You'll get an email when the price is hit.</div>
+                </div>
+              ) : (
+                <div className="space-y-3">
+                  {[...triggeredAlerts, ...activeAlerts, ...stoppedAlerts].map(a => {
+                    const currentPx = quotes[a.ticker]?.c;
+                    const isTriggered = a.status === 'triggered';
+                    const isActive    = a.status === 'active';
+                    const isStopped   = a.status === 'stopped';
+
+                    const borderColor = isTriggered ? "#fca5a5" : isStopped ? "#e5e5e5" : "#ececec";
+                    const shadowColor = isTriggered ? "0 0 0 3px #fee2e2" : "none";
+                    const opacity     = isStopped ? 0.6 : 1;
+
+                    return (
+                      <div key={a.id} className="rounded-2xl p-5 fade-in"
+                        style={{ background: "white", border: `1px solid ${borderColor}`, boxShadow: shadowColor, opacity }}>
+                        <div className="flex items-start justify-between gap-3 mb-3">
+                          <div className="flex items-center gap-2 flex-wrap">
+                            <span className="text-xs font-bold px-2 py-0.5 rounded-md" style={{ background: "#f0f0ec" }}>${a.ticker}</span>
+                            <span className="text-[11px] opacity-40">target</span>
+                            <span className="text-xs font-bold px-2 py-0.5 rounded-md flex items-center gap-0.5" style={{ background: "#f0f0ec" }}>
+                              <DollarSign size={9} className="opacity-60" />{Number(a.target_price).toFixed(2)}
+                            </span>
+                            {isTriggered && (
+                              <span className="text-[10px] font-bold uppercase tracking-wider px-2 py-0.5 rounded-full flex items-center gap-1" style={{ background: "#dc2626", color: "white" }}>
+                                <BellRing size={9} /> Triggered
+                              </span>
+                            )}
+                            {isActive && (
+                              <span className="text-[10px] font-bold uppercase tracking-wider px-2 py-0.5 rounded-full flex items-center gap-1" style={{ background: "#dcfce7", color: "#166534" }}>
+                                <Power size={9} /> Active
+                              </span>
+                            )}
+                            {isStopped && (
+                              <span className="text-[10px] font-bold uppercase tracking-wider px-2 py-0.5 rounded-full" style={{ background: "#f0f0ec", color: "#525252" }}>
+                                Stopped
+                              </span>
+                            )}
+                          </div>
+                          <div className="flex items-center gap-2">
+                            {isTriggered && (
+                              <button onClick={() => handleStopAlert(a.id)}
+                                className="text-xs font-medium px-3 py-1 rounded-md transition"
+                                style={{ background: "#1a1a1a", color: "white" }}>
+                                Mark as Stop
+                              </button>
+                            )}
+                            <button onClick={() => requestDeleteAlert(a.id, a.ticker)}
+                              className="p-1.5 rounded-full opacity-40 hover:opacity-100 hover:bg-red-50 transition" style={{ color: "#dc2626" }}>
+                              <Trash2 size={13} />
+                            </button>
+                          </div>
+                        </div>
+
+                        {a.notes && (
+                          <p className="text-sm opacity-70 mb-3 italic">"{a.notes}"</p>
+                        )}
+
+                        <div className="grid grid-cols-3 gap-3 mb-3">
+                          <div className="rounded-lg px-3 py-2" style={{ background: "#fafaf7" }}>
+                            <div className="text-[10px] tracking-widest uppercase opacity-40 mb-0.5">Current</div>
+                            <div className="text-sm font-semibold">{currentPx ? `$${currentPx.toFixed(2)}` : "—"}</div>
+                          </div>
+                          <div className="rounded-lg px-3 py-2" style={{ background: "#fafaf7" }}>
+                            <div className="text-[10px] tracking-widest uppercase opacity-40 mb-0.5">When set</div>
+                            <div className="text-sm font-semibold">${Number(a.start_price).toFixed(2)}</div>
+                          </div>
+                          <div className="rounded-lg px-3 py-2" style={{ background: "#fafaf7" }}>
+                            <div className="text-[10px] tracking-widest uppercase opacity-40 mb-0.5">
+                              {isTriggered ? "Triggered at" : "Distance"}
+                            </div>
+                            <div className="text-sm font-semibold">
+                              {isTriggered
+                                ? `$${Number(a.triggered_price).toFixed(2)}`
+                                : currentPx
+                                  ? `${(((Number(a.target_price) - currentPx) / currentPx) * 100).toFixed(2)}%`
+                                  : "—"}
+                            </div>
+                          </div>
+                        </div>
+
+                        <div className="text-[11px] opacity-50 flex items-center gap-2 flex-wrap">
+                          <span>Created {timeSinceText(new Date(a.created_at).getTime())}</span>
+                          {isTriggered && a.triggered_at && (
+                            <>
+                              <span>·</span>
+                              <span>Fired {timeSinceText(new Date(a.triggered_at).getTime())}</span>
+                            </>
+                          )}
+                          {isTriggered && (
+                            <>
+                              <span>·</span>
+                              <span>{a.email_sent ? "Email sent" : "Email not sent (no address)"}</span>
+                            </>
+                          )}
+                        </div>
+                      </div>
+                    );
+                  })}
+                </div>
+              )}
+            </section>
+          )}
         </main>
       </div>
 
@@ -1362,4 +1652,3 @@ export default function App() {
     </div>
   );
 }
-
