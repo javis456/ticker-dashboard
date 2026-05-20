@@ -4,7 +4,8 @@ import {
   ChevronRight, ChevronDown, Bell, RefreshCw, ExternalLink, Cloud, CloudOff,
   Copy, Check, Sparkles, Filter, Eye, Trash2, AlertCircle, Tag, Layers,
   CheckCheck, FileText, Calendar, Target, TrendingUpIcon, Zap, Clock,
-  BellRing, Mail, DollarSign, AlertCircle as AlertCircleIcon, Power
+  BellRing, Mail, DollarSign, AlertCircle as AlertCircleIcon, Power,
+  CalendarClock, Repeat, BookOpen, Lightbulb, ListChecks
 } from "lucide-react";
 import { AreaChart, Area, XAxis, YAxis, Tooltip, ResponsiveContainer } from "recharts";
 import { getQuote, getProfile, getNews, getCandles, classifyImpact, timeAgo } from "./lib/finnhub";
@@ -12,6 +13,7 @@ import { supabase, getIdentity, setIdentity, loadState, saveState } from "./lib/
 import { tagNews, AVAILABLE_TAGS, TAG_STYLES } from "./lib/tagger";
 import { loadSummaries, saveSummary, deleteSummary, generateSummary } from "./lib/summaries";
 import { loadUserEmail, saveUserEmail, loadAlerts, createAlert, stopAlert, deleteAlert } from "./lib/alerts";
+import { loadCatchupCards, saveCatchupCard, deleteCatchupCard, generateCatchupBriefing, computeDueState, periodToDays } from "./lib/catchup";
 
 const DEFAULT_STATE = {
   sectorGroups: [
@@ -561,6 +563,21 @@ export default function App() {
   const [alertError, setAlertError] = useState(null);
   const [creatingAlert, setCreatingAlert] = useState(false);
 
+  // ── Catchup state ───────────────────────────────────────────────────────────
+  const [catchupCards, setCatchupCards] = useState([]);
+  const [showNewCatchup, setShowNewCatchup] = useState(false);
+  const [cuName, setCuName] = useState("");
+  const [cuType, setCuType] = useState("stocks");
+  const [cuTickers, setCuTickers] = useState("");
+  const [cuTopics, setCuTopics] = useState("");
+  const [cuKeyInterests, setCuKeyInterests] = useState("");
+  const [cuRoutineValue, setCuRoutineValue] = useState(1);
+  const [cuRoutineUnit, setCuRoutineUnit] = useState("week");
+  const [cuError, setCuError] = useState(null);
+  const [generatingCatchup, setGeneratingCatchup] = useState({});  // { cardId: bool }
+  const [openCatchupCards, setOpenCatchupCards] = useState({});    // { cardId: bool }
+  const [openCatchupSummaries, setOpenCatchupSummaries] = useState({}); // { cardId_sumId: bool }
+
   const totalUnread = useMemo(
     () => (state.watchCards || []).reduce((sum, c) => sum + c.matches.filter(m => !m.isRead).length, 0),
     [state.watchCards]
@@ -570,6 +587,22 @@ export default function App() {
   const triggeredAlerts = useMemo(() => alerts.filter(a => a.status === 'triggered'), [alerts]);
   const activeAlerts    = useMemo(() => alerts.filter(a => a.status === 'active'),    [alerts]);
   const stoppedAlerts   = useMemo(() => alerts.filter(a => a.status === 'stopped'),   [alerts]);
+
+  // Sorted catchup cards: starred first, then overdue, then by created_at desc
+  const sortedCatchupCards = useMemo(() => {
+    return [...catchupCards].sort((a, b) => {
+      if ((b.starred ? 1 : 0) !== (a.starred ? 1 : 0)) return (b.starred ? 1 : 0) - (a.starred ? 1 : 0);
+      const aDue = computeDueState(a).status === 'overdue' ? 1 : 0;
+      const bDue = computeDueState(b).status === 'overdue' ? 1 : 0;
+      if (bDue !== aDue) return bDue - aDue;
+      return new Date(b.created_at).getTime() - new Date(a.created_at).getTime();
+    });
+  }, [catchupCards]);
+
+  const overdueCount = useMemo(
+    () => catchupCards.filter(c => computeDueState(c).status === 'overdue').length,
+    [catchupCards]
+  );
 
   useEffect(() => {
     document.title = totalUnread > 0 ? `(${totalUnread}) Ticker · alerts` : "Ticker — Your market, distilled";
@@ -600,6 +633,8 @@ export default function App() {
         const em = await loadUserEmail();
         setUserEmail(em);
         setEmailDraft(em);
+        const cu = await loadCatchupCards();
+        setCatchupCards(cu);
         setCloudStatus("synced");
       } catch { setCloudStatus("offline"); }
       setHydrated(true);
@@ -809,6 +844,10 @@ export default function App() {
       const id = confirmDelete.id;
       setAlerts(prev => prev.filter(a => a.id !== id));
       await deleteAlert(id);
+    } else if (confirmDelete.type === "catchup") {
+      const id = confirmDelete.id;
+      setCatchupCards(prev => prev.filter(c => c.id !== id));
+      await deleteCatchupCard(id);
     }
     setConfirmDelete(null);
   };
@@ -881,6 +920,130 @@ export default function App() {
   };
 
   const requestDeleteAlert = (id, ticker) => setConfirmDelete({ type: "alert", id, label: `alert on $${ticker}` });
+
+  // ── Catchup handlers ───────────────────────────────────────────────────────
+  const resetCatchupForm = () => {
+    setCuName(""); setCuType("stocks"); setCuTickers(""); setCuTopics("");
+    setCuKeyInterests(""); setCuRoutineValue(1); setCuRoutineUnit("week");
+    setCuError(null); setShowNewCatchup(false);
+  };
+
+  const createCatchupCard = async () => {
+    setCuError(null);
+    if (!cuName.trim()) { setCuError("Please give the card a name"); return; }
+    const tickers = cuTickers.split(",").map(s => s.trim().toUpperCase()).filter(Boolean);
+    const topics  = cuTopics.split(",").map(s => s.trim()).filter(Boolean);
+    if ((cuType === "stocks" || cuType === "stocks_and_topics") && tickers.length === 0) {
+      setCuError("Please add at least one ticker"); return;
+    }
+    if ((cuType === "topics" || cuType === "stocks_and_topics") && topics.length === 0) {
+      setCuError("Please add at least one topic"); return;
+    }
+    const id = "cu_" + Date.now();
+    const card = {
+      id, name: cuName.trim(), type: cuType,
+      tickers, topics, key_interests: cuKeyInterests.trim(),
+      routine_value: Number(cuRoutineValue) || 1,
+      routine_unit: cuRoutineUnit,
+      starred: false, summaries: [], last_run_at: null,
+      created_at: new Date().toISOString(),
+    };
+    await saveCatchupCard(card);
+    setCatchupCards(prev => [card, ...prev]);
+    // Pre-load price data for new tickers
+    tickers.forEach(t => { if (!quotes[t]) loadTicker(t); });
+    resetCatchupForm();
+  };
+
+  const toggleCatchupCardOpen = (id) =>
+    setOpenCatchupCards(prev => ({ ...prev, [id]: !prev[id] }));
+
+  const toggleCatchupSummaryOpen = (cardId, sumId) => {
+    const k = `${cardId}_${sumId}`;
+    setOpenCatchupSummaries(prev => ({ ...prev, [k]: !prev[k] }));
+  };
+
+  const toggleCatchupStar = async (card) => {
+    const updated = { ...card, starred: !card.starred };
+    setCatchupCards(prev => prev.map(c => c.id === card.id ? updated : c));
+    await saveCatchupCard(updated);
+  };
+
+  const deleteCatchupSummary = async (cardId, sumId) => {
+    const card = catchupCards.find(c => c.id === cardId);
+    if (!card) return;
+    const updated = { ...card, summaries: card.summaries.filter(s => s.id !== sumId) };
+    setCatchupCards(prev => prev.map(c => c.id === cardId ? updated : c));
+    await saveCatchupCard(updated);
+  };
+
+  const requestDeleteCatchupCard = (cardId, name) =>
+    setConfirmDelete({ type: "catchup", id: cardId, label: `"${name}"` });
+
+  const runCatchupGeneration = async (card) => {
+    setGeneratingCatchup(prev => ({ ...prev, [card.id]: true }));
+    try {
+      // 1. Compute window
+      const days = periodToDays(card.routine_value, card.routine_unit);
+      const toMs = Date.now();
+      const fromMs = toMs - days * 86400000;
+      const fromDate = new Date(fromMs).toISOString().slice(0, 10);
+      const toDate   = new Date(toMs).toISOString().slice(0, 10);
+
+      // 2. Fetch news per ticker for the window
+      const newsByTicker = {};
+      const tickers = card.tickers || [];
+      const finnhubDays = Math.min(Math.max(days, 1), 30); // finnhub free tier limit
+      for (const tk of tickers) {
+        try {
+          const fresh = await getNews(tk, finnhubDays).catch(() => []);
+          const fromSec = fromMs / 1000;
+          const toSec   = toMs / 1000;
+          newsByTicker[tk] = (fresh || [])
+            .filter(n => (n.datetime || 0) >= fromSec && (n.datetime || 0) <= toSec)
+            .slice(0, 15);
+        } catch {
+          newsByTicker[tk] = [];
+        }
+      }
+
+      // 3. Call the catchup API
+      const { briefing, meta } = await generateCatchupBriefing({
+        cardName: card.name,
+        type: card.type,
+        tickers,
+        topics: card.topics || [],
+        keyInterests: card.key_interests || "",
+        routineValue: card.routine_value,
+        routineUnit: card.routine_unit,
+        fromDate, toDate,
+        newsByTicker,
+      });
+
+      // 4. Append to card's summaries, update last_run_at
+      const sumId = "sum_" + Date.now();
+      const newSummary = {
+        id: sumId,
+        fromDate, toDate,
+        createdAt: new Date().toISOString(),
+        briefing, meta,
+      };
+      const updated = {
+        ...card,
+        summaries: [newSummary, ...(card.summaries || [])],
+        last_run_at: new Date().toISOString(),
+      };
+      await saveCatchupCard(updated);
+      setCatchupCards(prev => prev.map(c => c.id === card.id ? updated : c));
+      // Auto-open the new summary so user sees it
+      setOpenCatchupCards(prev => ({ ...prev, [card.id]: true }));
+      setOpenCatchupSummaries(prev => ({ ...prev, [`${card.id}_${sumId}`]: true }));
+    } catch (e) {
+      alert("Catchup generation failed: " + (e.message || e));
+    } finally {
+      setGeneratingCatchup(prev => ({ ...prev, [card.id]: false }));
+    }
+  };
 
   // ── Summarize: generate ─────────────────────────────────────────────────────
   const runSummary = async () => {
@@ -1007,6 +1170,7 @@ export default function App() {
                 { id: "watching",  label: "Watching",  badge: totalUnread, badgeColor: "#059669" },
                 { id: "summarize", label: "Summarize", badge: summaries.length, badgeColor: "#7c3aed" },
                 { id: "alerts",    label: "Alerts",    badge: triggeredAlerts.length, badgeColor: "#dc2626" },
+                { id: "catchup",   label: "Catchup",   badge: overdueCount, badgeColor: "#dc2626" },
               ].map(tab => (
                 <button key={tab.id} onClick={() => setView(tab.id)} className="px-3 py-1.5 text-sm rounded-full transition-all flex items-center gap-1.5"
                   style={{ background: view === tab.id ? "#1a1a1a" : "transparent", color: view === tab.id ? "#fafaf7" : "#1a1a1a" }}>
@@ -1048,6 +1212,7 @@ export default function App() {
             confirmDelete.type === "group"   ? `The group ${confirmDelete.label} will be deleted. Tickers inside are not deleted — they remain in other groups.` :
             confirmDelete.type === "card"    ? `The watching card ${confirmDelete.label} and all its saved matches will be permanently removed.` :
             confirmDelete.type === "alert"   ? `The ${confirmDelete.label} will be permanently removed.` :
+            confirmDelete.type === "catchup" ? `The Catchup card ${confirmDelete.label} and all its past briefings will be permanently removed.` :
                                                `This ${confirmDelete.label} will be permanently removed. This action cannot be undone.`
           }
           onConfirm={executeDelete} onCancel={() => setConfirmDelete(null)} />
@@ -1633,6 +1798,388 @@ export default function App() {
                             </>
                           )}
                         </div>
+                      </div>
+                    );
+                  })}
+                </div>
+              )}
+            </section>
+          )}
+
+          {/* ── CATCHUP VIEW ── */}
+          {view === "catchup" && (
+            <section>
+              <div className="mb-6 flex items-start justify-between gap-4 flex-wrap">
+                <div>
+                  <h2 className="font-serif-h text-3xl font-semibold mb-1">Catchup</h2>
+                  <p className="text-sm opacity-60 max-w-2xl">Build a recurring habit. Create a card for each topic or group of stocks you care about, then come back on schedule to generate a fresh briefing. Overdue cards get a red ring.</p>
+                </div>
+                <button onClick={() => setShowNewCatchup(true)}
+                  className="px-4 py-2 rounded-lg text-white text-sm font-medium flex items-center gap-1.5 flex-shrink-0"
+                  style={{ background: "#1a1a1a" }}>
+                  <Plus size={13} /> New card
+                </button>
+              </div>
+
+              {/* CREATE FORM */}
+              {showNewCatchup && (
+                <div className="rounded-2xl p-6 mb-6 fade-in" style={{ background: "white", border: "1px solid #ececec" }}>
+                  <div className="flex items-center gap-2 mb-4">
+                    <BookOpen size={14} className="opacity-50" />
+                    <div className="text-sm font-semibold">New Catchup card</div>
+                  </div>
+
+                  <div className="grid grid-cols-12 gap-3">
+                    {/* Name */}
+                    <div className="col-span-12">
+                      <label className="text-[10px] tracking-widest uppercase opacity-50 mb-1 block">Card name</label>
+                      <input value={cuName} onChange={e => setCuName(e.target.value)}
+                        placeholder="e.g. AMD CPU 3 days update"
+                        className="w-full text-sm px-3 py-2 rounded-lg border focus:outline-none focus:border-gray-900 transition"
+                        style={{ borderColor: "#e5e5e5", background: "#fafaf7" }} />
+                    </div>
+
+                    {/* Type */}
+                    <div className="col-span-12">
+                      <label className="text-[10px] tracking-widest uppercase opacity-50 mb-1 block">Type</label>
+                      <div className="flex gap-1 flex-wrap">
+                        {[
+                          { id: "stocks",            label: "Stocks only" },
+                          { id: "topics",            label: "Topics only" },
+                          { id: "stocks_and_topics", label: "Stocks + Topics" },
+                        ].map(t => (
+                          <button key={t.id} onClick={() => setCuType(t.id)}
+                            className="text-xs px-3 py-2 rounded-lg font-medium transition"
+                            style={{ background: cuType === t.id ? "#1a1a1a" : "#f0f0ec", color: cuType === t.id ? "white" : "#1a1a1a" }}>
+                            {t.label}
+                          </button>
+                        ))}
+                      </div>
+                    </div>
+
+                    {/* Tickers */}
+                    {(cuType === "stocks" || cuType === "stocks_and_topics") && (
+                      <div className="col-span-12">
+                        <label className="text-[10px] tracking-widest uppercase opacity-50 mb-1 block">Tickers (comma-separated)</label>
+                        <input value={cuTickers} onChange={e => setCuTickers(e.target.value.toUpperCase())}
+                          placeholder="e.g. NVDA, AMD, AVGO"
+                          className="w-full text-sm font-semibold px-3 py-2 rounded-lg border focus:outline-none focus:border-gray-900 transition"
+                          style={{ borderColor: "#e5e5e5", background: "#fafaf7" }} />
+                      </div>
+                    )}
+
+                    {/* Topics */}
+                    {(cuType === "topics" || cuType === "stocks_and_topics") && (
+                      <div className="col-span-12">
+                        <label className="text-[10px] tracking-widest uppercase opacity-50 mb-1 block">Topics (comma-separated)</label>
+                        <input value={cuTopics} onChange={e => setCuTopics(e.target.value)}
+                          placeholder="e.g. Data center, AI chips, Inference"
+                          className="w-full text-sm px-3 py-2 rounded-lg border focus:outline-none focus:border-gray-900 transition"
+                          style={{ borderColor: "#e5e5e5", background: "#fafaf7" }} />
+                      </div>
+                    )}
+
+                    {/* Key Interests */}
+                    <div className="col-span-12">
+                      <label className="text-[10px] tracking-widest uppercase opacity-50 mb-1 block">Key interests (optional)</label>
+                      <input value={cuKeyInterests} onChange={e => setCuKeyInterests(e.target.value)}
+                        placeholder="e.g. Product launches, customer wins, gross margin"
+                        className="w-full text-sm px-3 py-2 rounded-lg border focus:outline-none focus:border-gray-900 transition"
+                        style={{ borderColor: "#e5e5e5", background: "#fafaf7" }} />
+                    </div>
+
+                    {/* Routine */}
+                    <div className="col-span-12">
+                      <label className="text-[10px] tracking-widest uppercase opacity-50 mb-1 block">Routine</label>
+                      <div className="flex items-center gap-2">
+                        <span className="text-sm opacity-70">Every</span>
+                        <input type="number" min="1" value={cuRoutineValue}
+                          onChange={e => setCuRoutineValue(parseInt(e.target.value) || 1)}
+                          className="w-20 text-sm font-semibold text-center px-3 py-2 rounded-lg border focus:outline-none focus:border-gray-900 transition"
+                          style={{ borderColor: "#e5e5e5", background: "#fafaf7" }} />
+                        <div className="flex gap-1">
+                          {[
+                            { id: "day",   label: "day(s)" },
+                            { id: "week",  label: "week(s)" },
+                            { id: "month", label: "month(s)" },
+                          ].map(u => (
+                            <button key={u.id} onClick={() => setCuRoutineUnit(u.id)}
+                              className="text-xs px-3 py-2 rounded-lg font-medium transition"
+                              style={{ background: cuRoutineUnit === u.id ? "#1a1a1a" : "#f0f0ec", color: cuRoutineUnit === u.id ? "white" : "#1a1a1a" }}>
+                              {u.label}
+                            </button>
+                          ))}
+                        </div>
+                      </div>
+                    </div>
+
+                    {cuError && (
+                      <div className="col-span-12 text-xs px-3 py-2 rounded-lg" style={{ background: "#fee2e2", color: "#991b1b" }}>
+                        {cuError}
+                      </div>
+                    )}
+
+                    <div className="col-span-12 flex items-center justify-between mt-1">
+                      <p className="text-[11px] opacity-50">
+                        After creating, click "Generate update" to produce your first briefing.
+                      </p>
+                      <div className="flex gap-2">
+                        <button onClick={resetCatchupForm} className="px-4 py-2 rounded-lg text-sm" style={{ background: "#f0f0ec" }}>Cancel</button>
+                        <button onClick={createCatchupCard} className="px-4 py-2 rounded-lg text-white text-sm font-medium" style={{ background: "#1a1a1a" }}>
+                          Create card
+                        </button>
+                      </div>
+                    </div>
+                  </div>
+                </div>
+              )}
+
+              {/* CATCHUP CARDS LIST */}
+              {sortedCatchupCards.length === 0 && !showNewCatchup ? (
+                <div className="rounded-2xl p-12 text-center" style={{ background: "white", border: "1px solid #ececec" }}>
+                  <BookOpen size={32} className="mx-auto opacity-20 mb-3" />
+                  <div className="text-sm opacity-60">No Catchup cards yet.</div>
+                  <div className="text-xs opacity-40 mt-1">Build a routine. Add a card above to get started.</div>
+                </div>
+              ) : (
+                <div className="space-y-4">
+                  {sortedCatchupCards.map(card => {
+                    const due = computeDueState(card);
+                    const isOverdue = due.status === "overdue";
+                    const isOpen    = !!openCatchupCards[card.id];
+                    const isGenerating = !!generatingCatchup[card.id];
+                    const summaries = card.summaries || [];
+
+                    return (
+                      <div key={card.id} className="rounded-2xl fade-in overflow-hidden"
+                        style={{
+                          background: "white",
+                          border: isOverdue ? "1px solid #dc2626" : "1px solid #ececec",
+                          boxShadow: isOverdue ? "0 0 0 3px #fee2e2" : "none",
+                        }}>
+                        {/* CARD HEADER */}
+                        <div className="p-5 cursor-pointer" onClick={() => toggleCatchupCardOpen(card.id)}>
+                          <div className="flex items-start justify-between gap-3 mb-3">
+                            <div className="flex-1 min-w-0">
+                              <div className="flex items-center gap-2 mb-1 flex-wrap">
+                                {card.starred && (
+                                  <Star size={13} fill="#fbbf24" stroke="#fbbf24" className="flex-shrink-0" />
+                                )}
+                                <h3 className="font-serif-h text-xl font-semibold leading-tight">{card.name}</h3>
+                              </div>
+                              <div className="flex items-center gap-2 flex-wrap mt-2">
+                                <span className="text-[10px] font-semibold tracking-wider uppercase px-2 py-0.5 rounded-full" style={{
+                                  background: card.type === "stocks" ? "#dbeafe" : card.type === "topics" ? "#ede9fe" : "#fef3c7",
+                                  color:      card.type === "stocks" ? "#1e40af" : card.type === "topics" ? "#6d28d9" : "#92400e",
+                                }}>
+                                  {card.type === "stocks" ? "Stocks" : card.type === "topics" ? "Topics" : "Stocks + Topics"}
+                                </span>
+                                {(card.tickers || []).slice(0, 4).map(t => (
+                                  <span key={t} className="text-xs font-bold px-2 py-0.5 rounded-md" style={{ background: "#f0f0ec" }}>${t}</span>
+                                ))}
+                                {(card.tickers || []).length > 4 && (
+                                  <span className="text-[11px] opacity-50">+{card.tickers.length - 4} more</span>
+                                )}
+                                {(card.topics || []).slice(0, 3).map(t => (
+                                  <span key={t} className="text-[11px] px-2 py-0.5 rounded-md italic" style={{ background: "#fafaf7", color: "#525252" }}>{t}</span>
+                                ))}
+                                {(card.topics || []).length > 3 && (
+                                  <span className="text-[11px] opacity-50">+{card.topics.length - 3}</span>
+                                )}
+                              </div>
+                            </div>
+                            <div className="flex items-center gap-1 flex-shrink-0">
+                              <button onClick={e => { e.stopPropagation(); toggleCatchupStar(card); }}
+                                className="p-1.5 rounded-full opacity-50 hover:opacity-100 hover:bg-gray-100 transition" title="Star">
+                                <Star size={14} fill={card.starred ? "#fbbf24" : "none"} stroke={card.starred ? "#fbbf24" : "currentColor"} />
+                              </button>
+                              <button onClick={e => { e.stopPropagation(); requestDeleteCatchupCard(card.id, card.name); }}
+                                className="p-1.5 rounded-full opacity-40 hover:opacity-100 hover:bg-red-50 transition" style={{ color: "#dc2626" }}>
+                                <Trash2 size={13} />
+                              </button>
+                              <button className="p-1.5 rounded-full opacity-40 hover:opacity-100 hover:bg-gray-100 transition">
+                                {isOpen ? <ChevronDown size={14} /> : <ChevronRight size={14} />}
+                              </button>
+                            </div>
+                          </div>
+
+                          {/* Routine + Due status */}
+                          <div className="flex items-center justify-between gap-3 flex-wrap">
+                            <div className="flex items-center gap-3 text-[11px] opacity-60">
+                              <span className="flex items-center gap-1">
+                                <Repeat size={10} /> Every {card.routine_value} {card.routine_unit}{card.routine_value !== 1 ? "s" : ""}
+                              </span>
+                              <span>·</span>
+                              <span>{summaries.length} {summaries.length === 1 ? "briefing" : "briefings"}</span>
+                              {card.last_run_at && (
+                                <>
+                                  <span>·</span>
+                                  <span>Last run {timeSinceText(new Date(card.last_run_at).getTime())}</span>
+                                </>
+                              )}
+                            </div>
+                            <div className="flex items-center gap-2">
+                              <span className="text-[11px] font-semibold px-2 py-1 rounded-full flex items-center gap-1" style={{
+                                background: isOverdue ? "#fee2e2" : due.status === "due-today" ? "#fef3c7" : due.status === "due-soon" ? "#fef3c7" : "#dcfce7",
+                                color:      isOverdue ? "#991b1b" : due.status === "due-today" ? "#92400e" : due.status === "due-soon" ? "#92400e" : "#166534",
+                              }}>
+                                <CalendarClock size={10} />
+                                {isOverdue ? `Overdue by ${due.overdueDays}d`
+                                  : due.status === "due-today" ? "Due today"
+                                  : due.status === "due-soon"  ? `Due in ${due.untilDays}d`
+                                  : `Due in ${due.untilDays}d`}
+                              </span>
+                              <button
+                                onClick={e => { e.stopPropagation(); runCatchupGeneration(card); }}
+                                disabled={isGenerating}
+                                className="text-xs px-3 py-1.5 rounded-lg text-white font-medium flex items-center gap-1.5 disabled:opacity-30 transition"
+                                style={{ background: isOverdue ? "#dc2626" : "#1a1a1a" }}>
+                                {isGenerating ? <><RefreshCw size={11} className="animate-spin" /> Generating…</> : <><Sparkles size={11} /> Generate update</>}
+                              </button>
+                            </div>
+                          </div>
+                        </div>
+
+                        {/* SUMMARIES LIST (first layer) */}
+                        {isOpen && (
+                          <div className="border-t" style={{ borderColor: "#f0f0ec" }}>
+                            {summaries.length === 0 ? (
+                              <div className="px-5 py-6 text-center text-xs opacity-40 italic">
+                                No briefings yet. Click "Generate update" above to create your first one.
+                              </div>
+                            ) : (
+                              <div className="divide-y" style={{ borderColor: "#f0f0ec" }}>
+                                {summaries.map(s => {
+                                  const sumKey = `${card.id}_${s.id}`;
+                                  const sumOpen = !!openCatchupSummaries[sumKey];
+                                  const b = s.briefing || {};
+                                  return (
+                                    <div key={s.id}>
+                                      {/* SUMMARY ROW */}
+                                      <div className="px-5 py-3 cursor-pointer hover:bg-gray-50 transition group"
+                                        onClick={() => toggleCatchupSummaryOpen(card.id, s.id)}>
+                                        <div className="flex items-center justify-between gap-3">
+                                          <div className="flex items-center gap-3 min-w-0 flex-1">
+                                            {sumOpen ? <ChevronDown size={12} className="opacity-50 flex-shrink-0" /> : <ChevronRight size={12} className="opacity-50 flex-shrink-0" />}
+                                            <div className="flex-1 min-w-0">
+                                              <div className="text-sm font-medium truncate">
+                                                {b.tldr || `Briefing · ${s.fromDate} → ${s.toDate}`}
+                                              </div>
+                                              <div className="text-[11px] opacity-50 mt-0.5 flex items-center gap-2 flex-wrap">
+                                                <span>{s.fromDate} → {s.toDate}</span>
+                                                <span>·</span>
+                                                <span>Generated {timeSinceText(new Date(s.createdAt).getTime())}</span>
+                                                {s.meta?.costUSD != null && (
+                                                  <>
+                                                    <span>·</span>
+                                                    <span>Cost ${s.meta.costUSD.toFixed(4)}</span>
+                                                  </>
+                                                )}
+                                              </div>
+                                            </div>
+                                          </div>
+                                          <button onClick={e => { e.stopPropagation(); deleteCatchupSummary(card.id, s.id); }}
+                                            className="p-1 opacity-0 group-hover:opacity-40 hover:opacity-100 transition" style={{ color: "#dc2626" }}>
+                                            <X size={12} />
+                                          </button>
+                                        </div>
+                                      </div>
+
+                                      {/* SUMMARY DETAIL (second layer) */}
+                                      {sumOpen && (
+                                        <div className="px-5 pb-5 pt-1 bg-gray-50 border-t" style={{ borderColor: "#f0f0ec" }}>
+                                          {/* Key updates */}
+                                          {b.key_updates?.length > 0 && (
+                                            <div className="mb-5">
+                                              <div className="flex items-center gap-2 mb-3 mt-2">
+                                                <Zap size={11} className="opacity-60" />
+                                                <span className="text-[11px] font-semibold tracking-widest uppercase opacity-60">Key updates</span>
+                                              </div>
+                                              <div className="space-y-3">
+                                                {b.key_updates.map((u, i) => (
+                                                  <div key={i} className="bg-white rounded-xl p-4" style={{ border: "1px solid #ececec" }}>
+                                                    <div className="font-serif-h text-base font-bold leading-snug mb-1">{stripTags(u.title || "")}</div>
+                                                    <p className="text-sm opacity-70 leading-relaxed mb-2">{stripTags(u.summary || "")}</p>
+                                                    <div className="flex flex-wrap gap-1.5">
+                                                      {(u.related || []).map(t => (
+                                                        <span key={t} className="text-[10px] font-bold px-1.5 py-0.5 rounded-md" style={{ background: "#f0f0ec" }}>${t}</span>
+                                                      ))}
+                                                      {(u.sources || []).map((src, j) => (
+                                                        <a key={j} href={src.url} target="_blank" rel="noreferrer"
+                                                          className="inline-flex items-center gap-1 text-[11px] px-2 py-0.5 rounded-full hover:opacity-80 transition"
+                                                          style={{ background: "#f7f7f3", color: "#525252" }}>
+                                                          <ExternalLink size={9} /> {src.title || "Source"}
+                                                        </a>
+                                                      ))}
+                                                    </div>
+                                                  </div>
+                                                ))}
+                                              </div>
+                                            </div>
+                                          )}
+
+                                          {/* Key elements */}
+                                          {b.key_elements?.length > 0 && (
+                                            <div className="mb-4 bg-white rounded-xl p-4" style={{ border: "1px solid #ececec" }}>
+                                              <div className="flex items-center gap-2 mb-2">
+                                                <Lightbulb size={11} className="opacity-60" />
+                                                <span className="text-[11px] font-semibold tracking-widest uppercase opacity-60">Key elements</span>
+                                              </div>
+                                              <ul className="space-y-1.5">
+                                                {b.key_elements.map((e, i) => (
+                                                  <li key={i} className="text-sm opacity-70 leading-relaxed flex gap-2">
+                                                    <span className="opacity-40 flex-shrink-0">·</span>
+                                                    <span>{stripTags(e)}</span>
+                                                  </li>
+                                                ))}
+                                              </ul>
+                                            </div>
+                                          )}
+
+                                          {/* What to watch */}
+                                          {b.what_to_watch?.length > 0 && (
+                                            <div className="mb-4 bg-white rounded-xl p-4" style={{ border: "1px solid #ececec" }}>
+                                              <div className="flex items-center gap-2 mb-2">
+                                                <ListChecks size={11} className="opacity-60" />
+                                                <span className="text-[11px] font-semibold tracking-widest uppercase opacity-60">What to watch</span>
+                                              </div>
+                                              <ul className="space-y-1.5">
+                                                {b.what_to_watch.map((w, i) => (
+                                                  <li key={i} className="text-sm opacity-70 leading-relaxed flex gap-2">
+                                                    <span className="opacity-40 flex-shrink-0">→</span>
+                                                    <span>{stripTags(w)}</span>
+                                                  </li>
+                                                ))}
+                                              </ul>
+                                            </div>
+                                          )}
+
+                                          {/* Next events */}
+                                          {b.next_events?.length > 0 && (
+                                            <div className="bg-white rounded-xl p-4" style={{ border: "1px solid #ececec" }}>
+                                              <div className="flex items-center gap-2 mb-2">
+                                                <Clock size={11} className="opacity-60" />
+                                                <span className="text-[11px] font-semibold tracking-widest uppercase opacity-60">Next events</span>
+                                              </div>
+                                              <div className="space-y-2">
+                                                {b.next_events.map((ev, i) => (
+                                                  <div key={i} className="flex gap-3 items-start">
+                                                    <span className="text-[11px] font-semibold px-2 py-0.5 rounded-full flex-shrink-0" style={{ background: "#e0f2fe", color: "#0369a1" }}>{stripTags(ev.when || "")}</span>
+                                                    <span className="text-sm opacity-70 leading-relaxed">{stripTags(ev.what || "")}</span>
+                                                  </div>
+                                                ))}
+                                              </div>
+                                            </div>
+                                          )}
+                                        </div>
+                                      )}
+                                    </div>
+                                  );
+                                })}
+                              </div>
+                            )}
+                          </div>
+                        )}
                       </div>
                     );
                   })}
