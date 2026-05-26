@@ -1,4 +1,4 @@
-// Hawkeye client helper (v2 — after-close architecture).
+// Hawkeye client helper (v3 — user-pasted history).
 
 import { supabase, getIdentity } from './supabase';
 
@@ -28,7 +28,8 @@ export async function deleteHawkeyeCard(id) {
   await supabase.from('hawkeye_cards').delete().eq('id', id);
 }
 
-// Tell the server we want these tickers to be bootstrapped if not already.
+// Register tickers for server-side Alpha Vantage bootstrap (used as fallback
+// when user does not paste history).
 export async function registerTickersForBootstrap(tickers) {
   try {
     const res = await fetch('/api/hawkeye-register-tickers', {
@@ -36,18 +37,27 @@ export async function registerTickersForBootstrap(tickers) {
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ tickers }),
     });
-    if (!res.ok) {
-      console.warn('[hawkeye] register failed', res.status);
-      return null;
-    }
+    if (!res.ok) return null;
     return res.json();
   } catch (e) {
-    console.warn('[hawkeye] register error', e);
     return null;
   }
 }
 
-// Returns { [ticker]: { bootstrapped, last_close_ts, bootstrap_error } }
+// Send a single ticker's parsed candles to the server, marking it bootstrapped.
+export async function saveTickerHistory(ticker, candles) {
+  const res = await fetch('/api/hawkeye-save-history', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ ticker, candles }),
+  });
+  if (!res.ok) {
+    const err = await res.text();
+    throw new Error(`Save history failed: ${res.status} ${err}`);
+  }
+  return res.json();
+}
+
 export async function loadBootstrapStatus(tickers) {
   if (!supabase || tickers.length === 0) return {};
   const { data } = await supabase
@@ -59,7 +69,6 @@ export async function loadBootstrapStatus(tickers) {
   return map;
 }
 
-// ─── Helpers for the UI ──────────────────────────────────────────────────────
 export function describeCondition(c) {
   const dir = c.direction === 'gain' ? 'gain' : 'loss';
   const refLabel = c.reference === 'lowest'  ? 'recent low'
