@@ -6,7 +6,8 @@ import {
   CheckCheck, FileText, Calendar, Target, TrendingUpIcon, Zap, Clock,
   BellRing, Mail, DollarSign, AlertCircle as AlertCircleIcon, Power,
   CalendarClock, Repeat, BookOpen, Lightbulb, ListChecks,
-  Eye as EyeIcon, Crosshair, ArrowUpRight, ArrowDownRight, Activity
+  Eye as EyeIcon, Crosshair, ArrowUpRight, ArrowDownRight, Activity,
+  ClipboardPaste, FileUp
 } from "lucide-react";
 import { AreaChart, Area, XAxis, YAxis, Tooltip, ResponsiveContainer } from "recharts";
 import { getQuote, getProfile, getNews, getCandles, classifyImpact, timeAgo } from "./lib/finnhub";
@@ -15,7 +16,8 @@ import { tagNews, AVAILABLE_TAGS, TAG_STYLES } from "./lib/tagger";
 import { loadSummaries, saveSummary, deleteSummary, generateSummary } from "./lib/summaries";
 import { loadUserEmail, saveUserEmail, loadAlerts, createAlert, stopAlert, deleteAlert } from "./lib/alerts";
 import { loadCatchupCards, saveCatchupCard, deleteCatchupCard, generateCatchupBriefing, computeDueState, periodToDays } from "./lib/catchup";
-import { loadHawkeyeCards, saveHawkeyeCard, deleteHawkeyeCard, describeCondition, registerTickersForBootstrap, loadBootstrapStatus } from "./lib/hawkeye";
+import { loadHawkeyeCards, saveHawkeyeCard, deleteHawkeyeCard, describeCondition, registerTickersForBootstrap, loadBootstrapStatus, saveTickerHistory } from "./lib/hawkeye";
+import { parseHistoricalPaste } from "./lib/parseHistoricalPaste";
 
 const DEFAULT_STATE = {
   sectorGroups: [
@@ -595,6 +597,14 @@ export default function App() {
   const [bootstrapStatus, setBootstrapStatus] = useState({});  // { ticker: { bootstrapped, ... } }
   const [hkError, setHkError] = useState(null);
 
+  // New: per-ticker history paste state during create flow
+  const [hkHistoryByTicker, setHkHistoryByTicker] = useState({});
+  const [hkCurrentPasteTicker, setHkCurrentPasteTicker] = useState("");
+
+  // New: add-condition affordance on existing cards
+  const [addingConditionToCard, setAddingConditionToCard] = useState(null);
+  const [draftCondition, setDraftCondition] = useState({ direction: "gain", thresholdPct: 10, triggerWindowDays: 14, reference: "lowest" });
+
   const totalUnread = useMemo(
     () => (state.watchCards || []).reduce((sum, c) => sum + c.matches.filter(m => !m.isRead).length, 0),
     [state.watchCards]
@@ -1033,9 +1043,22 @@ export default function App() {
     setConfirmDelete({ type: "catchup", id: cardId, label: `"${name}"` });
 
   // ── Hawkeye handlers ───────────────────────────────────────────────────────
+  // Preview of the tickers that will be in the new card, based on current form state
+  const hkCandidateTickers = useMemo(() => {
+    if (hkSource === "group") {
+      if (!hkGroupRef) return [];
+      const [kind, gid] = hkGroupRef.split(":");
+      const sourceList = kind === "sector" ? state.sectorGroups : state.customGroups;
+      const g = sourceList.find(g => g.id === gid);
+      return g ? g.tickers : [];
+    }
+    return hkCustomTickers.split(",").map(s => s.trim().toUpperCase()).filter(Boolean);
+  }, [hkSource, hkGroupRef, hkCustomTickers, state.sectorGroups, state.customGroups]);
+
   const resetHawkeyeForm = () => {
     setHkName(""); setHkSource("group"); setHkGroupRef(""); setHkCustomTickers("");
     setHkConditions([{ direction: "gain", thresholdPct: 15, triggerWindowDays: 14, reference: "lowest" }]);
+    setHkHistoryByTicker({}); setHkCurrentPasteTicker("");
     setHkError(null); setShowNewHawkeye(false);
   };
 
@@ -1089,12 +1112,15 @@ export default function App() {
     await saveHawkeyeCard(card);
     setHawkeyeCards(prev => [card, ...prev]);
     setOpenHawkeyeCards(prev => ({ ...prev, [id]: true }));
-    // Register tickers for server-side bootstrap (fetches Alpha Vantage history)
-    await registerTickersForBootstrap(tickers);
-    // Refresh bootstrap status for these tickers
+    // For tickers the user did NOT paste history for, fall back to server bootstrap
+    const tickersWithoutHistory = tickers.filter(t => !hkHistoryByTicker[t]?.saved);
+    if (tickersWithoutHistory.length > 0) {
+      await registerTickersForBootstrap(tickersWithoutHistory);
+    }
+    // Refresh bootstrap status for all
     const status = await loadBootstrapStatus(tickers);
     setBootstrapStatus(prev => ({ ...prev, ...status }));
-    // Preload data for the tickers
+    // Preload quote/news/profile
     tickers.forEach(t => { if (!quotes[t]) loadTicker(t); });
     resetHawkeyeForm();
   };
@@ -1135,6 +1161,78 @@ export default function App() {
 
   const requestDeleteHawkeyeCard = (cardId, name) =>
     setConfirmDelete({ type: "hawkeye", id: cardId, label: `"${name}"` });
+
+  // ── History paste handlers ────────────────────────────────────────────────
+  const previewPasteForTicker = (ticker, text) => {
+    setHkHistoryByTicker(prev => ({
+      ...prev,
+      [ticker]: { ...(prev[ticker] || {}), paste: text }
+    }));
+    if (!text.trim()) {
+      setHkHistoryByTicker(prev => ({
+        ...prev,
+        [ticker]: { ...(prev[ticker] || {}), parsed: null, error: null }
+      }));
+      return;
+    }
+    const result = parseHistoricalPaste(text);
+    setHkHistoryByTicker(prev => ({
+      ...prev,
+      [ticker]: {
+        ...(prev[ticker] || {}),
+        parsed: result.ok ? result : null,
+        error: result.ok ? null : result.error,
+      }
+    }));
+  };
+
+  const submitPasteForTicker = async (ticker) => {
+    const st = hkHistoryByTicker[ticker];
+    if (!st || !st.parsed || !st.parsed.ok) return;
+    setHkHistoryByTicker(prev => ({
+      ...prev,
+      [ticker]: { ...prev[ticker], saving: true, error: null }
+    }));
+    const res = await saveTickerHistory(ticker, st.parsed.candles);
+    setHkHistoryByTicker(prev => ({
+      ...prev,
+      [ticker]: {
+        ...prev[ticker],
+        saving: false,
+        saved: res.ok,
+        error: res.ok ? null : res.error,
+      }
+    }));
+    if (res.ok) {
+      const status = await loadBootstrapStatus([ticker]);
+      setBootstrapStatus(prev => ({ ...prev, ...status }));
+    }
+  };
+
+  // ── Add condition to existing card ────────────────────────────────────────
+  const beginAddCondition = (cardId) => {
+    setAddingConditionToCard(cardId);
+    setDraftCondition({ direction: "gain", thresholdPct: 10, triggerWindowDays: 14, reference: "lowest" });
+  };
+  const cancelAddCondition = () => setAddingConditionToCard(null);
+  const submitAddCondition = async (cardId) => {
+    if (!draftCondition.thresholdPct || draftCondition.thresholdPct <= 0) return;
+    if (!draftCondition.triggerWindowDays || draftCondition.triggerWindowDays <= 0) return;
+    const card = hawkeyeCards.find(c => c.id === cardId);
+    if (!card) return;
+    const updated = { ...card, conditions: [...(card.conditions || []), { ...draftCondition }] };
+    setHawkeyeCards(prev => prev.map(c => c.id === cardId ? updated : c));
+    await saveHawkeyeCard(updated);
+    setAddingConditionToCard(null);
+  };
+  const removeConditionFromCard = async (cardId, conditionIdx) => {
+    const card = hawkeyeCards.find(c => c.id === cardId);
+    if (!card) return;
+    if ((card.conditions || []).length <= 1) return; // keep at least one
+    const updated = { ...card, conditions: card.conditions.filter((_, i) => i !== conditionIdx) };
+    setHawkeyeCards(prev => prev.map(c => c.id === cardId ? updated : c));
+    await saveHawkeyeCard(updated);
+  };
 
   const runCatchupGeneration = async (card) => {
     setGeneratingCatchup(prev => ({ ...prev, [card.id]: true }));
@@ -2445,6 +2543,109 @@ export default function App() {
                     </div>
                   </div>
 
+                  {/* ── Historical data input ── */}
+                  {hkCandidateTickers.length > 0 && (
+                    <div className="mb-4 mt-2">
+                      <div className="flex items-center justify-between mb-2">
+                        <label className="text-[10px] tracking-widest uppercase opacity-50">Provide historical data (recommended)</label>
+                        <span className="text-[11px] opacity-50">
+                          {hkCandidateTickers.filter(t => hkHistoryByTicker[t]?.saved).length} / {hkCandidateTickers.length} loaded
+                        </span>
+                      </div>
+                      <div className="p-3 rounded-lg mb-2 flex items-start gap-2 text-[11px]" style={{ background: "#eef2ff", color: "#3730a3" }}>
+                        <ClipboardPaste size={13} className="mt-0.5 flex-shrink-0" />
+                        <div>
+                          Paste historical OHLC data for each ticker so Hawkeye works immediately. Supports Yahoo Finance, stockanalysis.com, Investing.com, TradingView, or any CSV/TSV with Date and Close columns. Skipped tickers will be bootstrapped automatically over time.
+                        </div>
+                      </div>
+
+                      {/* Ticker chips — click to select for paste */}
+                      <div className="flex flex-wrap gap-1.5 mb-3">
+                        {hkCandidateTickers.map(t => {
+                          const st = hkHistoryByTicker[t];
+                          const isSelected = hkCurrentPasteTicker === t;
+                          const isDone = st?.saved;
+                          return (
+                            <button key={t} onClick={() => setHkCurrentPasteTicker(t)}
+                              className="text-xs font-bold px-2 py-1 rounded-md transition flex items-center gap-1"
+                              style={{
+                                background: isDone ? "#dcfce7" : isSelected ? "#1a1a1a" : "#f0f0ec",
+                                color:      isDone ? "#166534" : isSelected ? "white" : "#1a1a1a",
+                              }}>
+                              {isDone && <Check size={10} />}
+                              ${t}
+                            </button>
+                          );
+                        })}
+                      </div>
+
+                      {/* Paste box for selected ticker */}
+                      {hkCurrentPasteTicker && (() => {
+                        const st = hkHistoryByTicker[hkCurrentPasteTicker] || {};
+                        return (
+                          <div className="rounded-lg p-3 fade-in" style={{ background: "#fafaf7", border: "1px solid #e5e5e5" }}>
+                            <div className="flex items-center justify-between mb-2">
+                              <span className="text-xs font-semibold">
+                                Paste history for <span className="font-bold">${hkCurrentPasteTicker}</span>
+                              </span>
+                              {st.saved && (
+                                <span className="text-[10px] font-semibold flex items-center gap-1" style={{ color: "#166534" }}>
+                                  <Check size={11} /> Saved
+                                </span>
+                              )}
+                            </div>
+                            <textarea
+                              value={st.paste || ""}
+                              onChange={e => previewPasteForTicker(hkCurrentPasteTicker, e.target.value)}
+                              placeholder={"Paste rows from your source. Example:\nDate,Open,High,Low,Close\n2026-05-01,182.0,184.5,181.2,183.7\n..."}
+                              rows={6}
+                              className="w-full text-xs font-mono px-2 py-2 rounded-md focus:outline-none"
+                              style={{ background: "white", border: "1px solid #e5e5e5" }}
+                            />
+                            {st.parsed && (
+                              <div className="mt-2 text-[11px]" style={{ color: "#166534" }}>
+                                ✓ Parsed {st.parsed.count} candles, {st.parsed.fromDate} → {st.parsed.toDate}
+                                {st.parsed.warnings?.length > 0 && (
+                                  <span className="opacity-60"> · {st.parsed.warnings.length} row(s) skipped</span>
+                                )}
+                              </div>
+                            )}
+                            {st.error && (
+                              <div className="mt-2 text-[11px]" style={{ color: "#991b1b" }}>
+                                ✗ {st.error}
+                              </div>
+                            )}
+                            <div className="flex items-center justify-end gap-2 mt-2">
+                              <button
+                                onClick={() => submitPasteForTicker(hkCurrentPasteTicker)}
+                                disabled={!st.parsed || st.saving || st.saved}
+                                className="text-xs px-3 py-1.5 rounded-md text-white font-medium transition disabled:opacity-30 flex items-center gap-1"
+                                style={{ background: st.saved ? "#059669" : "#1a1a1a" }}>
+                                {st.saving ? <><RefreshCw size={11} className="animate-spin" /> Saving</> :
+                                 st.saved ? <><Check size={11} /> Saved</> :
+                                 <><FileUp size={11} /> Save history</>}
+                              </button>
+                              {st.saved && (() => {
+                                const nextTicker = hkCandidateTickers.find(t => t !== hkCurrentPasteTicker && !hkHistoryByTicker[t]?.saved);
+                                if (!nextTicker) return null;
+                                return (
+                                  <button onClick={() => setHkCurrentPasteTicker(nextTicker)}
+                                    className="text-xs px-3 py-1.5 rounded-md font-medium" style={{ background: "#f0f0ec" }}>
+                                    Next: ${nextTicker} →
+                                  </button>
+                                );
+                              })()}
+                            </div>
+                          </div>
+                        );
+                      })()}
+
+                      {!hkCurrentPasteTicker && (
+                        <div className="text-[11px] opacity-50 italic">Click a ticker chip above to paste its historical data.</div>
+                      )}
+                    </div>
+                  )}
+
                   {hkError && (
                     <div className="text-xs px-3 py-2 rounded-lg mb-3" style={{ background: "#fee2e2", color: "#991b1b" }}>
                       {hkError}
@@ -2529,13 +2730,42 @@ export default function App() {
                           </div>
 
                           {/* Conditions summary */}
-                          <div className="flex items-center gap-2 flex-wrap mb-1">
+                          <div className="flex items-center gap-2 flex-wrap mb-1" onClick={e => e.stopPropagation()}>
                             {(card.conditions || []).map((c, i) => (
-                              <span key={i} className="text-[11px] px-2 py-1 rounded-md font-medium flex items-center gap-1" style={{ background: c.direction === "gain" ? "#dcfce7" : "#fee2e2", color: c.direction === "gain" ? "#166534" : "#991b1b" }}>
+                              <span key={i} className="text-[11px] px-2 py-1 rounded-md font-medium flex items-center gap-1 group/cond" style={{ background: c.direction === "gain" ? "#dcfce7" : "#fee2e2", color: c.direction === "gain" ? "#166534" : "#991b1b" }}>
                                 {c.direction === "gain" ? <ArrowUpRight size={10} /> : <ArrowDownRight size={10} />}
-                                {c.thresholdPct}% in {c.triggerWindowDays}d from {c.reference === "lowest" ? "low" : c.reference === "highest" ? "high" : "start"}
+                                <span>{c.thresholdPct}% in {c.triggerWindowDays}d from {c.reference === "lowest" ? "low" : c.reference === "highest" ? "high" : "start"}</span>
+                                {(card.conditions || []).length > 1 && (
+                                  <button onClick={() => removeConditionFromCard(card.id, i)} className="opacity-0 group-hover/cond:opacity-100 transition" title="Remove condition">
+                                    <X size={9} />
+                                  </button>
+                                )}
                               </span>
                             ))}
+                            {addingConditionToCard === card.id ? (
+                              <div className="w-full mt-2 p-2 rounded-lg flex items-center gap-1 flex-wrap" style={{ background: "white", border: "1px solid #e5e5e5" }}>
+                                <span className="text-[11px] opacity-60">when price</span>
+                                <select value={draftCondition.direction} onChange={e => setDraftCondition(d => ({ ...d, direction: e.target.value }))} className="text-[11px] px-1.5 py-0.5 rounded font-semibold focus:outline-none" style={{ background: "#f7f7f3", border: "1px solid #e5e5e5" }}>
+                                  <option value="gain">gains</option>
+                                  <option value="loss">loses</option>
+                                </select>
+                                <input type="number" min="1" value={draftCondition.thresholdPct} onChange={e => setDraftCondition(d => ({ ...d, thresholdPct: parseFloat(e.target.value) || 0 }))} className="w-12 text-[11px] px-1.5 py-0.5 rounded font-semibold text-center focus:outline-none" style={{ background: "#f7f7f3", border: "1px solid #e5e5e5" }} />
+                                <span className="text-[11px] opacity-60">% in</span>
+                                <input type="number" min="1" value={draftCondition.triggerWindowDays} onChange={e => setDraftCondition(d => ({ ...d, triggerWindowDays: parseInt(e.target.value) || 1 }))} className="w-12 text-[11px] px-1.5 py-0.5 rounded font-semibold text-center focus:outline-none" style={{ background: "#f7f7f3", border: "1px solid #e5e5e5" }} />
+                                <span className="text-[11px] opacity-60">d from</span>
+                                <select value={draftCondition.reference} onChange={e => setDraftCondition(d => ({ ...d, reference: e.target.value }))} className="text-[11px] px-1.5 py-0.5 rounded font-semibold focus:outline-none" style={{ background: "#f7f7f3", border: "1px solid #e5e5e5" }}>
+                                  <option value="lowest">low</option>
+                                  <option value="highest">high</option>
+                                  <option value="first">start</option>
+                                </select>
+                                <button onClick={() => submitAddCondition(card.id)} className="text-[11px] px-2 py-0.5 rounded-md text-white font-medium" style={{ background: "#1a1a1a" }}>Add</button>
+                                <button onClick={cancelAddCondition} className="text-[11px] px-2 py-0.5 rounded-md font-medium" style={{ background: "#f0f0ec" }}>Cancel</button>
+                              </div>
+                            ) : (
+                              <button onClick={() => beginAddCondition(card.id)} className="text-[11px] px-2 py-1 rounded-md font-medium flex items-center gap-1 transition" style={{ background: "#f0f0ec", color: "#525252" }}>
+                                <Plus size={9} /> Add condition
+                              </button>
+                            )}
                           </div>
                           <div className="text-[11px] opacity-50 mt-2 flex items-center gap-2 flex-wrap">
                             <span>{hits.length} {hits.length === 1 ? "hit" : "hits"} total</span>
