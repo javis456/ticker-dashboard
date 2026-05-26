@@ -5,7 +5,8 @@ import {
   Copy, Check, Sparkles, Filter, Eye, Trash2, AlertCircle, Tag, Layers,
   CheckCheck, FileText, Calendar, Target, TrendingUpIcon, Zap, Clock,
   BellRing, Mail, DollarSign, AlertCircle as AlertCircleIcon, Power,
-  CalendarClock, Repeat, BookOpen, Lightbulb, ListChecks
+  CalendarClock, Repeat, BookOpen, Lightbulb, ListChecks,
+  Eye as EyeIcon, Crosshair, ArrowUpRight, ArrowDownRight, Activity
 } from "lucide-react";
 import { AreaChart, Area, XAxis, YAxis, Tooltip, ResponsiveContainer } from "recharts";
 import { getQuote, getProfile, getNews, getCandles, classifyImpact, timeAgo } from "./lib/finnhub";
@@ -14,6 +15,7 @@ import { tagNews, AVAILABLE_TAGS, TAG_STYLES } from "./lib/tagger";
 import { loadSummaries, saveSummary, deleteSummary, generateSummary } from "./lib/summaries";
 import { loadUserEmail, saveUserEmail, loadAlerts, createAlert, stopAlert, deleteAlert } from "./lib/alerts";
 import { loadCatchupCards, saveCatchupCard, deleteCatchupCard, generateCatchupBriefing, computeDueState, periodToDays } from "./lib/catchup";
+import { loadHawkeyeCards, saveHawkeyeCard, deleteHawkeyeCard, describeCondition, registerTickersForBootstrap, loadBootstrapStatus } from "./lib/hawkeye";
 
 const DEFAULT_STATE = {
   sectorGroups: [
@@ -578,6 +580,21 @@ export default function App() {
   const [openCatchupCards, setOpenCatchupCards] = useState({});    // { cardId: bool }
   const [openCatchupSummaries, setOpenCatchupSummaries] = useState({}); // { cardId_sumId: bool }
 
+  // ── Hawkeye state ───────────────────────────────────────────────────────────
+  const [hawkeyeCards, setHawkeyeCards] = useState([]);
+  const [showNewHawkeye, setShowNewHawkeye] = useState(false);
+  const [openHawkeyeCards, setOpenHawkeyeCards] = useState({});
+  // Form state
+  const [hkName, setHkName] = useState("");
+  const [hkSource, setHkSource] = useState("group"); // 'group' | 'custom'
+  const [hkGroupRef, setHkGroupRef] = useState(""); // "sector:s1" or "custom:g1"
+  const [hkCustomTickers, setHkCustomTickers] = useState("");
+  const [hkConditions, setHkConditions] = useState([
+    { direction: "gain", thresholdPct: 15, triggerWindowDays: 14, reference: "lowest" }
+  ]);
+  const [bootstrapStatus, setBootstrapStatus] = useState({});  // { ticker: { bootstrapped, ... } }
+  const [hkError, setHkError] = useState(null);
+
   const totalUnread = useMemo(
     () => (state.watchCards || []).reduce((sum, c) => sum + c.matches.filter(m => !m.isRead).length, 0),
     [state.watchCards]
@@ -602,6 +619,12 @@ export default function App() {
   const overdueCount = useMemo(
     () => catchupCards.filter(c => computeDueState(c).status === 'overdue').length,
     [catchupCards]
+  );
+
+  // Hawkeye: total unread hits across all enabled cards
+  const hawkeyeUnreadCount = useMemo(
+    () => hawkeyeCards.reduce((sum, c) => sum + (c.hits || []).filter(h => !h.isRead).length, 0),
+    [hawkeyeCards]
   );
 
   useEffect(() => {
@@ -635,6 +658,13 @@ export default function App() {
         setEmailDraft(em);
         const cu = await loadCatchupCards();
         setCatchupCards(cu);
+        const hk = await loadHawkeyeCards();
+        setHawkeyeCards(hk);
+        const allHkTickers = [...new Set((hk || []).flatMap(c => c.tickers || []))];
+        if (allHkTickers.length > 0) {
+          const status = await loadBootstrapStatus(allHkTickers);
+          setBootstrapStatus(status);
+        }
         setCloudStatus("synced");
       } catch { setCloudStatus("offline"); }
       setHydrated(true);
@@ -694,6 +724,24 @@ export default function App() {
     const id = setInterval(() => { loadAlerts().then(setAlerts).catch(() => {}); }, 60_000);
     return () => clearInterval(id);
   }, [hydrated]);
+
+  // Refresh hawkeye cards from DB every 60s
+  useEffect(() => {
+    if (!hydrated) return;
+    const id = setInterval(() => { loadHawkeyeCards().then(setHawkeyeCards).catch(() => {}); }, 60_000);
+    return () => clearInterval(id);
+  }, [hydrated]);
+
+  // Refresh bootstrap status every 5 min for any unbootstrapped tickers
+  useEffect(() => {
+    if (!hydrated) return;
+    const tickers = [...new Set(hawkeyeCards.flatMap(c => c.tickers || []))];
+    const id = setInterval(() => {
+      if (tickers.length === 0) return;
+      loadBootstrapStatus(tickers).then(s => setBootstrapStatus(prev => ({ ...prev, ...s }))).catch(() => {});
+    }, 5 * 60_000);
+    return () => clearInterval(id);
+  }, [hydrated, hawkeyeCards]);
 
   useEffect(() => {
     if (!hydrated) return;
@@ -848,6 +896,10 @@ export default function App() {
       const id = confirmDelete.id;
       setCatchupCards(prev => prev.filter(c => c.id !== id));
       await deleteCatchupCard(id);
+    } else if (confirmDelete.type === "hawkeye") {
+      const id = confirmDelete.id;
+      setHawkeyeCards(prev => prev.filter(c => c.id !== id));
+      await deleteHawkeyeCard(id);
     }
     setConfirmDelete(null);
   };
@@ -979,6 +1031,110 @@ export default function App() {
 
   const requestDeleteCatchupCard = (cardId, name) =>
     setConfirmDelete({ type: "catchup", id: cardId, label: `"${name}"` });
+
+  // ── Hawkeye handlers ───────────────────────────────────────────────────────
+  const resetHawkeyeForm = () => {
+    setHkName(""); setHkSource("group"); setHkGroupRef(""); setHkCustomTickers("");
+    setHkConditions([{ direction: "gain", thresholdPct: 15, triggerWindowDays: 14, reference: "lowest" }]);
+    setHkError(null); setShowNewHawkeye(false);
+  };
+
+  const addHkCondition = () => {
+    setHkConditions(prev => [...prev, { direction: "gain", thresholdPct: 10, triggerWindowDays: 14, reference: "lowest" }]);
+  };
+  const removeHkCondition = (i) => setHkConditions(prev => prev.filter((_, idx) => idx !== i));
+  const updateHkCondition = (i, key, value) =>
+    setHkConditions(prev => prev.map((c, idx) => idx === i ? { ...c, [key]: value } : c));
+
+  const createHawkeyeCard = async () => {
+    setHkError(null);
+    if (!hkName.trim()) { setHkError("Please give the card a name"); return; }
+
+    let tickers = [];
+    let groupId = null;
+    let groupName = null;
+
+    if (hkSource === "group") {
+      if (!hkGroupRef) { setHkError("Please pick a group"); return; }
+      const [kind, gid] = hkGroupRef.split(":");
+      const sourceList = kind === "sector" ? state.sectorGroups : state.customGroups;
+      const g = sourceList.find(g => g.id === gid);
+      if (!g || g.tickers.length === 0) { setHkError("Pick a group that contains at least one ticker"); return; }
+      tickers = g.tickers;
+      groupId = g.id;
+      groupName = g.name;
+    } else {
+      tickers = hkCustomTickers.split(",").map(s => s.trim().toUpperCase()).filter(Boolean);
+      if (tickers.length === 0) { setHkError("Please add at least one ticker"); return; }
+    }
+
+    if (hkConditions.length === 0) { setHkError("Please add at least one condition"); return; }
+    for (const c of hkConditions) {
+      if (!c.thresholdPct || c.thresholdPct <= 0) { setHkError("All conditions need a positive threshold %"); return; }
+      if (!c.triggerWindowDays || c.triggerWindowDays <= 0) { setHkError("All conditions need a positive trigger window"); return; }
+    }
+
+    const id = "hk_" + Date.now();
+    const card = {
+      id, name: hkName.trim(),
+      source: hkSource,
+      group_id: groupId,
+      group_name: groupName || hkName.trim(),
+      tickers,
+      conditions: hkConditions,
+      hits: [],
+      enabled: true,
+      created_at: new Date().toISOString(),
+    };
+    await saveHawkeyeCard(card);
+    setHawkeyeCards(prev => [card, ...prev]);
+    setOpenHawkeyeCards(prev => ({ ...prev, [id]: true }));
+    // Register tickers for server-side bootstrap (fetches Alpha Vantage history)
+    await registerTickersForBootstrap(tickers);
+    // Refresh bootstrap status for these tickers
+    const status = await loadBootstrapStatus(tickers);
+    setBootstrapStatus(prev => ({ ...prev, ...status }));
+    // Preload data for the tickers
+    tickers.forEach(t => { if (!quotes[t]) loadTicker(t); });
+    resetHawkeyeForm();
+  };
+
+  const toggleHawkeyeCardOpen = (id) =>
+    setOpenHawkeyeCards(prev => ({ ...prev, [id]: !prev[id] }));
+
+  const markHawkeyeHitRead = async (cardId, hitId) => {
+    const card = hawkeyeCards.find(c => c.id === cardId);
+    if (!card) return;
+    const updated = { ...card, hits: card.hits.map(h => h.id === hitId ? { ...h, isRead: true } : h) };
+    setHawkeyeCards(prev => prev.map(c => c.id === cardId ? updated : c));
+    await saveHawkeyeCard(updated);
+  };
+
+  const markAllHawkeyeHitsRead = async (cardId) => {
+    const card = hawkeyeCards.find(c => c.id === cardId);
+    if (!card) return;
+    const updated = { ...card, hits: card.hits.map(h => ({ ...h, isRead: true })) };
+    setHawkeyeCards(prev => prev.map(c => c.id === cardId ? updated : c));
+    await saveHawkeyeCard(updated);
+  };
+
+  // Delete a specific hit — this re-arms the condition so it can fire again
+  const deleteHawkeyeHit = async (cardId, hitId) => {
+    const card = hawkeyeCards.find(c => c.id === cardId);
+    if (!card) return;
+    const updated = { ...card, hits: card.hits.filter(h => h.id !== hitId) };
+    setHawkeyeCards(prev => prev.map(c => c.id === cardId ? updated : c));
+    await saveHawkeyeCard(updated);
+  };
+
+  const toggleHawkeyeEnabled = async (card) => {
+    const updated = { ...card, enabled: !card.enabled };
+    setHawkeyeCards(prev => prev.map(c => c.id === card.id ? updated : c));
+    await saveHawkeyeCard(updated);
+  };
+
+  const requestDeleteHawkeyeCard = (cardId, name) =>
+    setConfirmDelete({ type: "hawkeye", id: cardId, label: `"${name}"` });
 
   const runCatchupGeneration = async (card) => {
     setGeneratingCatchup(prev => ({ ...prev, [card.id]: true }));
@@ -1171,6 +1327,7 @@ export default function App() {
                 { id: "summarize", label: "Summarize", badge: summaries.length, badgeColor: "#7c3aed" },
                 { id: "alerts",    label: "Alerts",    badge: triggeredAlerts.length, badgeColor: "#dc2626" },
                 { id: "catchup",   label: "Catchup",   badge: overdueCount, badgeColor: "#dc2626" },
+                { id: "hawkeye",   label: "Hawkeye",   badge: hawkeyeUnreadCount, badgeColor: "#7c3aed" },
               ].map(tab => (
                 <button key={tab.id} onClick={() => setView(tab.id)} className="px-3 py-1.5 text-sm rounded-full transition-all flex items-center gap-1.5"
                   style={{ background: view === tab.id ? "#1a1a1a" : "transparent", color: view === tab.id ? "#fafaf7" : "#1a1a1a" }}>
@@ -1213,6 +1370,7 @@ export default function App() {
             confirmDelete.type === "card"    ? `The watching card ${confirmDelete.label} and all its saved matches will be permanently removed.` :
             confirmDelete.type === "alert"   ? `The ${confirmDelete.label} will be permanently removed.` :
             confirmDelete.type === "catchup" ? `The Catchup card ${confirmDelete.label} and all its past briefings will be permanently removed.` :
+            confirmDelete.type === "hawkeye" ? `The Hawkeye card ${confirmDelete.label} and all its fired hits will be permanently removed.` :
                                                `This ${confirmDelete.label} will be permanently removed. This action cannot be undone.`
           }
           onConfirm={executeDelete} onCancel={() => setConfirmDelete(null)} />
@@ -2177,6 +2335,290 @@ export default function App() {
                                   );
                                 })}
                               </div>
+                            )}
+                          </div>
+                        )}
+                      </div>
+                    );
+                  })}
+                </div>
+              )}
+            </section>
+          )}
+
+          {/* ── HAWKEYE VIEW ── */}
+          {view === "hawkeye" && (
+            <section>
+              <div className="mb-6 flex items-start justify-between gap-4 flex-wrap">
+                <div>
+                  <h2 className="font-serif-h text-3xl font-semibold mb-1">Hawkeye</h2>
+                  <p className="text-sm opacity-60 max-w-2xl">Set rule-based alerts to catch early breakouts in a group of stocks. No AI — just precise math on closing prices. Checked once daily after US market close.</p>
+                </div>
+                <button onClick={() => setShowNewHawkeye(true)} className="px-4 py-2 rounded-lg text-white text-sm font-medium flex items-center gap-1.5 flex-shrink-0" style={{ background: "#1a1a1a" }}>
+                  <Plus size={13} /> New Hawkeye card
+                </button>
+              </div>
+
+              {/* CREATE FORM */}
+              {showNewHawkeye && (
+                <div className="rounded-2xl p-6 mb-6 fade-in" style={{ background: "white", border: "1px solid #ececec" }}>
+                  <div className="flex items-center gap-2 mb-4">
+                    <Crosshair size={14} className="opacity-50" />
+                    <div className="text-sm font-semibold">New Hawkeye card</div>
+                  </div>
+
+                  <div className="grid grid-cols-12 gap-3 mb-4">
+                    {/* Name */}
+                    <div className="col-span-12">
+                      <label className="text-[10px] tracking-widest uppercase opacity-50 mb-1 block">Card name</label>
+                      <input value={hkName} onChange={e => setHkName(e.target.value)} placeholder="e.g. AI Chip breakout watch" className="w-full text-sm px-3 py-2 rounded-lg border focus:outline-none focus:border-gray-900 transition" style={{ borderColor: "#e5e5e5", background: "#fafaf7" }} />
+                    </div>
+
+                    {/* Source */}
+                    <div className="col-span-12">
+                      <label className="text-[10px] tracking-widest uppercase opacity-50 mb-1 block">Stocks to watch</label>
+                      <div className="flex gap-1 mb-2">
+                        <button onClick={() => setHkSource("group")} className="text-xs px-3 py-2 rounded-lg font-medium transition" style={{ background: hkSource === "group" ? "#1a1a1a" : "#f0f0ec", color: hkSource === "group" ? "white" : "#1a1a1a" }}>
+                          Pick an existing group
+                        </button>
+                        <button onClick={() => setHkSource("custom")} className="text-xs px-3 py-2 rounded-lg font-medium transition" style={{ background: hkSource === "custom" ? "#1a1a1a" : "#f0f0ec", color: hkSource === "custom" ? "white" : "#1a1a1a" }}>
+                          Custom tickers
+                        </button>
+                      </div>
+                      {hkSource === "group" ? (
+                        <select value={hkGroupRef} onChange={e => setHkGroupRef(e.target.value)} className="w-full text-sm px-3 py-2 rounded-lg focus:outline-none" style={{ background: "#fafaf7", border: "1px solid #e5e5e5" }}>
+                          <option value="">Choose a group…</option>
+                          <optgroup label="Sectors">
+                            {(state.sectorGroups || []).map(g => (
+                              <option key={"sector:" + g.id} value={"sector:" + g.id}>{g.name} ({g.tickers.length})</option>
+                            ))}
+                          </optgroup>
+                          <optgroup label="My Groups">
+                            {(state.customGroups || []).map(g => (
+                              <option key={"custom:" + g.id} value={"custom:" + g.id}>{g.name} ({g.tickers.length})</option>
+                            ))}
+                          </optgroup>
+                        </select>
+                      ) : (
+                        <input value={hkCustomTickers} onChange={e => setHkCustomTickers(e.target.value.toUpperCase())} placeholder="e.g. NVDA, AMD, AVGO, MRVL" className="w-full text-sm font-semibold px-3 py-2 rounded-lg border focus:outline-none focus:border-gray-900 transition" style={{ borderColor: "#e5e5e5", background: "#fafaf7" }} />
+                      )}
+                    </div>
+                  </div>
+
+                  {/* Conditions builder */}
+                  <div className="mb-3">
+                    <div className="flex items-center justify-between mb-2">
+                      <label className="text-[10px] tracking-widest uppercase opacity-50">Conditions (any of these will fire)</label>
+                      <button onClick={addHkCondition} className="text-[11px] font-medium flex items-center gap-1 opacity-70 hover:opacity-100">
+                        <Plus size={11} /> Add condition
+                      </button>
+                    </div>
+                    <div className="space-y-2">
+                      {hkConditions.map((c, i) => (
+                        <div key={i} className="p-3 rounded-lg" style={{ background: "#fafaf7", border: "1px solid #e5e5e5" }}>
+                          <div className="flex items-center gap-2 flex-wrap text-sm">
+                            <span className="opacity-60">Trigger when price</span>
+                            <select value={c.direction} onChange={e => updateHkCondition(i, "direction", e.target.value)} className="text-xs px-2 py-1 rounded-md font-semibold focus:outline-none" style={{ background: "white", border: "1px solid #e5e5e5" }}>
+                              <option value="gain">gains</option>
+                              <option value="loss">loses</option>
+                            </select>
+                            <input type="number" min="1" max="500" value={c.thresholdPct} onChange={e => updateHkCondition(i, "thresholdPct", parseFloat(e.target.value) || 0)} className="w-16 text-xs px-2 py-1 rounded-md font-semibold text-center focus:outline-none" style={{ background: "white", border: "1px solid #e5e5e5" }} />
+                            <span className="opacity-60">% within last</span>
+                            <input type="number" min="1" max="365" value={c.triggerWindowDays} onChange={e => updateHkCondition(i, "triggerWindowDays", parseInt(e.target.value) || 1)} className="w-16 text-xs px-2 py-1 rounded-md font-semibold text-center focus:outline-none" style={{ background: "white", border: "1px solid #e5e5e5" }} />
+                            <span className="opacity-60">day(s), measured from</span>
+                            <select value={c.reference} onChange={e => updateHkCondition(i, "reference", e.target.value)} className="text-xs px-2 py-1 rounded-md font-semibold focus:outline-none" style={{ background: "white", border: "1px solid #e5e5e5" }}>
+                              <option value="lowest">recent low</option>
+                              <option value="highest">recent high</option>
+                              <option value="first">start of window</option>
+                            </select>
+                            {hkConditions.length > 1 && (
+                              <button onClick={() => removeHkCondition(i)} className="ml-auto p-1 rounded hover:bg-red-50 transition" style={{ color: "#dc2626" }}>
+                                <X size={12} />
+                              </button>
+                            )}
+                          </div>
+                          <div className="text-[10px] opacity-50 mt-2 ml-1">
+                            Reads: "{describeCondition(c)}"
+                          </div>
+                        </div>
+                      ))}
+                    </div>
+                  </div>
+
+                  {hkError && (
+                    <div className="text-xs px-3 py-2 rounded-lg mb-3" style={{ background: "#fee2e2", color: "#991b1b" }}>
+                      {hkError}
+                    </div>
+                  )}
+
+                  <div className="flex items-center justify-between">
+                    <p className="text-[11px] opacity-50">
+                      Conditions are checked once daily after market close. No AI — pure math on closing prices.
+                    </p>
+                    <div className="flex gap-2">
+                      <button onClick={resetHawkeyeForm} className="px-4 py-2 rounded-lg text-sm" style={{ background: "#f0f0ec" }}>Cancel</button>
+                      <button onClick={createHawkeyeCard} className="px-4 py-2 rounded-lg text-white text-sm font-medium" style={{ background: "#1a1a1a" }}>
+                        Create card
+                      </button>
+                    </div>
+                  </div>
+                </div>
+              )}
+
+              {/* CARDS LIST */}
+              {hawkeyeCards.length === 0 && !showNewHawkeye ? (
+                <div className="rounded-2xl p-12 text-center" style={{ background: "white", border: "1px solid #ececec" }}>
+                  <Crosshair size={32} className="mx-auto opacity-20 mb-3" />
+                  <div className="text-sm opacity-60">No Hawkeye cards yet.</div>
+                  <div className="text-xs opacity-40 mt-1">Build one to start catching early breakouts.</div>
+                </div>
+              ) : (
+                <div className="space-y-4">
+                  {hawkeyeCards.map(card => {
+                    const isOpen = !!openHawkeyeCards[card.id];
+                    const hits = card.hits || [];
+                    const unread = hits.filter(h => !h.isRead).length;
+                    const borderColor = unread > 0 ? "#a78bfa" : "#ececec";
+                    const shadow = unread > 0 ? "0 0 0 3px #f5f3ff" : "none";
+
+                    return (
+                      <div key={card.id} className="rounded-2xl fade-in overflow-hidden" style={{ background: "white", border: `1px solid ${borderColor}`, boxShadow: shadow, opacity: card.enabled ? 1 : 0.6 }}>
+                        {/* HEADER */}
+                        <div className="p-5 cursor-pointer" onClick={() => toggleHawkeyeCardOpen(card.id)}>
+                          <div className="flex items-start justify-between gap-3 mb-3">
+                            <div className="flex-1 min-w-0">
+                              <div className="flex items-center gap-2 mb-1 flex-wrap">
+                                <Crosshair size={14} style={{ color: "#7c3aed" }} className="flex-shrink-0" />
+                                <h3 className="font-serif-h text-xl font-semibold leading-tight">{card.name}</h3>
+                                {!card.enabled && (
+                                  <span className="text-[10px] font-bold uppercase tracking-wider px-2 py-0.5 rounded-full" style={{ background: "#f0f0ec", color: "#525252" }}>
+                                    Paused
+                                  </span>
+                                )}
+                              </div>
+                              <div className="flex items-center gap-2 flex-wrap mt-2">
+                                {card.source === "group" && card.group_name && (
+                                  <span className="text-[10px] font-semibold tracking-wider uppercase px-2 py-0.5 rounded-full" style={{ background: "#ede9fe", color: "#6d28d9" }}>
+                                    Group · {card.group_name}
+                                  </span>
+                                )}
+                                {(card.tickers || []).slice(0, 6).map(t => (
+                                  <span key={t} className="text-xs font-bold px-2 py-0.5 rounded-md" style={{ background: "#f0f0ec" }}>${t}</span>
+                                ))}
+                                {(card.tickers || []).length > 6 && (
+                                  <span className="text-[11px] opacity-50">+{card.tickers.length - 6} more</span>
+                                )}
+                              </div>
+                            </div>
+                            <div className="flex items-center gap-1 flex-shrink-0">
+                              {unread > 0 && (
+                                <div className="flex items-center gap-1 px-2 py-1 rounded-full text-[11px] font-bold mr-1" style={{ background: "#7c3aed", color: "white" }}>
+                                  <Bell size={10} /> {unread} new
+                                </div>
+                              )}
+                              <button onClick={e => { e.stopPropagation(); toggleHawkeyeEnabled(card); }} className="p-1.5 rounded-full opacity-50 hover:opacity-100 hover:bg-gray-100 transition" title={card.enabled ? "Pause" : "Resume"}>
+                                <Power size={13} />
+                              </button>
+                              <button onClick={e => { e.stopPropagation(); requestDeleteHawkeyeCard(card.id, card.name); }} className="p-1.5 rounded-full opacity-40 hover:opacity-100 hover:bg-red-50 transition" style={{ color: "#dc2626" }}>
+                                <Trash2 size={13} />
+                              </button>
+                              <button className="p-1.5 rounded-full opacity-40 hover:opacity-100 hover:bg-gray-100 transition">
+                                {isOpen ? <ChevronDown size={14} /> : <ChevronRight size={14} />}
+                              </button>
+                            </div>
+                          </div>
+
+                          {/* Conditions summary */}
+                          <div className="flex items-center gap-2 flex-wrap mb-1">
+                            {(card.conditions || []).map((c, i) => (
+                              <span key={i} className="text-[11px] px-2 py-1 rounded-md font-medium flex items-center gap-1" style={{ background: c.direction === "gain" ? "#dcfce7" : "#fee2e2", color: c.direction === "gain" ? "#166534" : "#991b1b" }}>
+                                {c.direction === "gain" ? <ArrowUpRight size={10} /> : <ArrowDownRight size={10} />}
+                                {c.thresholdPct}% in {c.triggerWindowDays}d from {c.reference === "lowest" ? "low" : c.reference === "highest" ? "high" : "start"}
+                              </span>
+                            ))}
+                          </div>
+                          <div className="text-[11px] opacity-50 mt-2 flex items-center gap-2 flex-wrap">
+                            <span>{hits.length} {hits.length === 1 ? "hit" : "hits"} total</span>
+                            {card.last_checked && (
+                              <>
+                                <span>·</span>
+                                <span>Last checked {timeSinceText(new Date(card.last_checked).getTime())}</span>
+                              </>
+                            )}
+                            {(() => {
+                              const pending = (card.tickers || []).filter(t => bootstrapStatus[t] && !bootstrapStatus[t].bootstrapped);
+                              if (pending.length === 0) return null;
+                              return (
+                                <>
+                                  <span>·</span>
+                                  <span className="flex items-center gap-1" style={{ color: "#7c3aed" }}>
+                                    <RefreshCw size={9} className="animate-spin" /> Preparing {pending.length} ticker{pending.length === 1 ? "" : "s"}
+                                  </span>
+                                </>
+                              );
+                            })()}
+                          </div>
+                        </div>
+
+                        {/* HITS LIST */}
+                        {isOpen && (
+                          <div className="border-t" style={{ borderColor: "#f0f0ec" }}>
+                            {hits.length === 0 ? (
+                              <div className="px-5 py-6 text-center text-xs opacity-40 italic">
+                                Watching. No hits yet — alerts will appear here when a stock matches a condition.
+                              </div>
+                            ) : (
+                              <>
+                                {unread > 0 && (
+                                  <div className="px-5 py-2.5 flex items-center justify-end" style={{ background: "#fafaf7", borderBottom: "1px solid #f0f0ec" }}>
+                                    <button onClick={() => markAllHawkeyeHitsRead(card.id)} className="text-[11px] font-medium flex items-center gap-1 opacity-60 hover:opacity-100 transition">
+                                      <CheckCheck size={11} /> Mark all read
+                                    </button>
+                                  </div>
+                                )}
+                                <div className="divide-y" style={{ borderColor: "#f0f0ec" }}>
+                                  {hits.map(h => {
+                                    const cond = h.condition || {};
+                                    const isGain = cond.direction === "gain";
+                                    return (
+                                      <div key={h.id} className="px-5 py-4 group transition" style={{ background: h.isRead ? "white" : "#faf5ff" }}>
+                                        <div className="flex items-start justify-between gap-3">
+                                          <div className="flex-1 min-w-0">
+                                            <div className="flex items-center gap-2 mb-2 flex-wrap">
+                                              {!h.isRead && <div className="w-1.5 h-1.5 rounded-full" style={{ background: "#7c3aed" }} />}
+                                              <span className="text-xs font-bold px-2 py-0.5 rounded-md" style={{ background: "#f0f0ec" }}>${h.ticker}</span>
+                                              <span className="text-[11px] font-bold flex items-center gap-1" style={{ color: isGain ? "#059669" : "#dc2626" }}>
+                                                {isGain ? <ArrowUpRight size={11} /> : <ArrowDownRight size={11} />}
+                                                {h.pctChange > 0 ? "+" : ""}{h.pctChange}%
+                                              </span>
+                                              <span className="text-[11px] opacity-50">from {cond.reference === "lowest" ? "low" : cond.reference === "highest" ? "high" : "start"} of last {cond.triggerWindowDays}d</span>
+                                              <span className="text-[11px] opacity-30">·</span>
+                                              <span className="text-[11px] opacity-50">{timeSinceText(new Date(h.firedAt).getTime())}</span>
+                                            </div>
+                                            <div className="text-sm leading-relaxed">
+                                              <span className="opacity-60">Fired at </span>
+                                              <span className="font-semibold">${Number(h.firedPrice).toFixed(2)}</span>
+                                              <span className="opacity-60"> · reference {cond.reference} on {h.refDate} was </span>
+                                              <span className="font-semibold">${Number(h.refPrice).toFixed(2)}</span>
+                                              <span className="opacity-60"> · condition: {cond.thresholdPct}% {cond.direction}</span>
+                                            </div>
+                                          </div>
+                                          <div className="flex flex-col gap-1 opacity-40 group-hover:opacity-100 transition">
+                                            {!h.isRead && (
+                                              <button onClick={() => markHawkeyeHitRead(card.id, h.id)} title="Mark read" className="p-1 rounded hover:bg-gray-100" style={{ color: "#7c3aed" }}>
+                                                <Check size={12} />
+                                              </button>
+                                            )}
+                                            <button onClick={() => deleteHawkeyeHit(card.id, h.id)} title="Delete (re-arms the condition)" className="p-1 rounded hover:bg-gray-100">
+                                              <X size={12} />
+                                            </button>
+                                          </div>
+                                        </div>
+                                      </div>
+                                    );
+                                  })}
+                                </div>
+                              </>
                             )}
                           </div>
                         )}
