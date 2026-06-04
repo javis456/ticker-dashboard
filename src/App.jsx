@@ -815,8 +815,10 @@ export default function App() {
       (card?.tickers || []).forEach(t => { if (!tickerHistoryCache[t]) tickers.add(t); });
     });
     if (tickers.size === 0) return;
-    fetchTickerHistoryForCard([...tickers]);
-  }, [hydrated, openHawkeyeCards, hawkeyeCards, tickerHistoryCache, fetchTickerHistoryForCard]);
+    loadTickerHistory([...tickers]).then(map => {
+      setTickerHistoryCache(prev => ({ ...prev, ...map }));
+    }).catch(() => {});
+  }, [hydrated, openHawkeyeCards, hawkeyeCards, tickerHistoryCache]);
 
   useEffect(() => {
     if (!hydrated) return;
@@ -1198,15 +1200,6 @@ export default function App() {
     const key = `${cardId}_${ticker}`;
     setExpandedTickerChart(prev => ({ ...prev, [key]: !prev[key] }));
   };
-
-  // v4: load full candle history for a list of tickers into the cache
-  const fetchTickerHistoryForCard = useCallback(async (tickers) => {
-    if (!tickers || tickers.length === 0) return;
-    const needFetch = tickers.filter(t => !tickerHistoryCache[t]);
-    if (needFetch.length === 0) return;
-    const map = await loadTickerHistory(needFetch);
-    setTickerHistoryCache(prev => ({ ...prev, ...map }));
-  }, [tickerHistoryCache]);
 
   // v4: manually trigger a check for this user's enabled Hawkeye cards
   const runHawkeyeCheckForCard = async (cardId) => {
