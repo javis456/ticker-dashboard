@@ -1,4 +1,4 @@
-// Hawkeye client helper (v3 — user-pasted history).
+// Hawkeye client helper (v4 — visible data + manual check).
 
 import { supabase, getIdentity } from './supabase';
 
@@ -28,8 +28,6 @@ export async function deleteHawkeyeCard(id) {
   await supabase.from('hawkeye_cards').delete().eq('id', id);
 }
 
-// Register tickers for server-side Alpha Vantage bootstrap (used as fallback
-// when user does not paste history).
 export async function registerTickersForBootstrap(tickers) {
   try {
     const res = await fetch('/api/hawkeye-register-tickers', {
@@ -39,12 +37,9 @@ export async function registerTickersForBootstrap(tickers) {
     });
     if (!res.ok) return null;
     return res.json();
-  } catch (e) {
-    return null;
-  }
+  } catch (e) { return null; }
 }
 
-// Send a single ticker's parsed candles to the server, marking it bootstrapped.
 export async function saveTickerHistory(ticker, candles) {
   const res = await fetch('/api/hawkeye-save-history', {
     method: 'POST',
@@ -67,6 +62,39 @@ export async function loadBootstrapStatus(tickers) {
   const map = {};
   (data || []).forEach(r => { map[r.ticker] = r; });
   return map;
+}
+
+// NEW: Full candle data for chart display
+export async function loadTickerHistory(tickers) {
+  if (!supabase || tickers.length === 0) return {};
+  const { data } = await supabase
+    .from('hawkeye_history')
+    .select('ticker, candles, last_close_ts, bootstrapped')
+    .in('ticker', tickers);
+  const map = {};
+  (data || []).forEach(r => {
+    map[r.ticker] = {
+      candles: r.candles || [],
+      last_close_ts: r.last_close_ts ? Number(r.last_close_ts) : null,
+      bootstrapped: r.bootstrapped,
+    };
+  });
+  return map;
+}
+
+// NEW: Manual run-check trigger
+export async function runHawkeyeCheckNow() {
+  const identity = getIdentity();
+  const res = await fetch('/api/hawkeye-run-now', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ identity }),
+  });
+  if (!res.ok) {
+    const err = await res.text();
+    throw new Error(`Run-now failed: ${res.status} ${err}`);
+  }
+  return res.json();
 }
 
 export function describeCondition(c) {
