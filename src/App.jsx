@@ -16,7 +16,7 @@ import { tagNews, AVAILABLE_TAGS, TAG_STYLES } from "./lib/tagger";
 import { loadSummaries, saveSummary, deleteSummary, generateSummary } from "./lib/summaries";
 import { loadUserEmail, saveUserEmail, loadAlerts, createAlert, stopAlert, deleteAlert } from "./lib/alerts";
 import { loadCatchupCards, saveCatchupCard, deleteCatchupCard, generateCatchupBriefing, computeDueState, periodToDays } from "./lib/catchup";
-import { loadHawkeyeCards, saveHawkeyeCard, deleteHawkeyeCard, describeCondition, registerTickersForBootstrap, loadBootstrapStatus, saveTickerHistory } from "./lib/hawkeye";
+import { loadHawkeyeCards, saveHawkeyeCard, deleteHawkeyeCard, describeCondition, registerTickersForBootstrap, loadBootstrapStatus, saveTickerHistory, loadTickerHistory, runHawkeyeCheckNow } from "./lib/hawkeye";
 import { parseHistoricalPaste } from "./lib/parseHistoricalPaste";
 
 const DEFAULT_STATE = {
@@ -152,6 +152,51 @@ function PriceChart({ symbol, isUp }) {
           <YAxis domain={[minC, maxC]} tick={{ fontSize: 10, fill: "#a3a3a3" }} tickLine={false} axisLine={false} tickFormatter={v => `$${v.toFixed(0)}`} width={48} />
           <Tooltip content={<ChartTooltip />} cursor={{ stroke: "#e5e5e5", strokeWidth: 1 }} />
           <Area type="monotone" dataKey="close" stroke={color} strokeWidth={1.5} fill={`url(#${fillId})`} dot={false} activeDot={{ r: 3, fill: color, strokeWidth: 0 }} />
+        </AreaChart>
+      </ResponsiveContainer>
+    </div>
+  );
+}
+
+function HawkeyeMiniChart({ ticker, candles, livePrice }) {
+  const data = useMemo(() => {
+    if (!candles || candles.length === 0) return [];
+    return candles.slice(-90).map(c => ({
+      date: new Date(c.ts).toISOString().slice(5, 10),  // MM-DD
+      close: c.close,
+    }));
+  }, [candles]);
+
+  if (data.length === 0) {
+    return <div className="text-xs opacity-40 italic text-center py-6">No candle data yet</div>;
+  }
+
+  const closes = data.map(d => d.close);
+  const minC = Math.min(...closes) * 0.99;
+  const maxC = Math.max(...closes) * 1.01;
+  const tickInterval = Math.max(1, Math.floor(data.length / 6));
+  const fillId = `hk-fill-${ticker}`;
+
+  return (
+    <div>
+      <div className="flex items-center justify-between mb-2">
+        <span className="text-[10px] tracking-widest uppercase opacity-40">Last {data.length} sessions</span>
+        {livePrice > 0 && (
+          <span className="text-[10px] opacity-60">Live: <span className="font-semibold">${livePrice.toFixed(2)}</span></span>
+        )}
+      </div>
+      <ResponsiveContainer width="100%" height={140}>
+        <AreaChart data={data} margin={{ top: 2, right: 0, left: 0, bottom: 0 }}>
+          <defs>
+            <linearGradient id={fillId} x1="0" y1="0" x2="0" y2="1">
+              <stop offset="0%" stopColor="#7c3aed" stopOpacity={0.22} />
+              <stop offset="100%" stopColor="#7c3aed" stopOpacity={0} />
+            </linearGradient>
+          </defs>
+          <XAxis dataKey="date" tick={{ fontSize: 9, fill: "#a3a3a3" }} tickLine={false} axisLine={false} interval={tickInterval} />
+          <YAxis domain={[minC, maxC]} tick={{ fontSize: 9, fill: "#a3a3a3" }} tickLine={false} axisLine={false} tickFormatter={v => `$${v.toFixed(0)}`} width={42} />
+          <Tooltip content={<ChartTooltip />} cursor={{ stroke: "#e5e5e5", strokeWidth: 1 }} />
+          <Area type="monotone" dataKey="close" stroke="#7c3aed" strokeWidth={1.5} fill={`url(#${fillId})`} dot={false} activeDot={{ r: 3, fill: "#7c3aed", strokeWidth: 0 }} />
         </AreaChart>
       </ResponsiveContainer>
     </div>
@@ -597,6 +642,12 @@ export default function App() {
   const [bootstrapStatus, setBootstrapStatus] = useState({});  // { ticker: { bootstrapped, ... } }
   const [hkError, setHkError] = useState(null);
 
+  // v4: per-ticker chart data + UI state for the data status panel
+  const [tickerHistoryCache, setTickerHistoryCache] = useState({});      // { ticker: { candles, last_close_ts, bootstrapped } }
+  const [expandedTickerChart, setExpandedTickerChart] = useState({});    // { `${cardId}_${ticker}`: true }
+  const [runningHawkeyeCheck, setRunningHawkeyeCheck] = useState({});    // { [cardId]: true }
+  const [hawkeyeCheckResult, setHawkeyeCheckResult] = useState({});      // { [cardId]: { updated, fired, errors } }
+
   // New: per-ticker history paste state during create flow
   const [hkHistoryByTicker, setHkHistoryByTicker] = useState({});
   const [hkCurrentPasteTicker, setHkCurrentPasteTicker] = useState("");
@@ -752,6 +803,20 @@ export default function App() {
     }, 5 * 60_000);
     return () => clearInterval(id);
   }, [hydrated, hawkeyeCards]);
+
+  // v4: when a Hawkeye card opens, load full candle history for its tickers
+  useEffect(() => {
+    if (!hydrated) return;
+    const openIds = Object.keys(openHawkeyeCards).filter(id => openHawkeyeCards[id]);
+    if (openIds.length === 0) return;
+    const tickers = new Set();
+    openIds.forEach(cid => {
+      const card = hawkeyeCards.find(c => c.id === cid);
+      (card?.tickers || []).forEach(t => { if (!tickerHistoryCache[t]) tickers.add(t); });
+    });
+    if (tickers.size === 0) return;
+    fetchTickerHistoryForCard([...tickers]);
+  }, [hydrated, openHawkeyeCards, hawkeyeCards, tickerHistoryCache, fetchTickerHistoryForCard]);
 
   useEffect(() => {
     if (!hydrated) return;
@@ -1127,6 +1192,43 @@ export default function App() {
 
   const toggleHawkeyeCardOpen = (id) =>
     setOpenHawkeyeCards(prev => ({ ...prev, [id]: !prev[id] }));
+
+  // v4: expand/collapse the inline chart for a specific ticker inside a specific card
+  const toggleTickerChartExpand = (cardId, ticker) => {
+    const key = `${cardId}_${ticker}`;
+    setExpandedTickerChart(prev => ({ ...prev, [key]: !prev[key] }));
+  };
+
+  // v4: load full candle history for a list of tickers into the cache
+  const fetchTickerHistoryForCard = useCallback(async (tickers) => {
+    if (!tickers || tickers.length === 0) return;
+    const needFetch = tickers.filter(t => !tickerHistoryCache[t]);
+    if (needFetch.length === 0) return;
+    const map = await loadTickerHistory(needFetch);
+    setTickerHistoryCache(prev => ({ ...prev, ...map }));
+  }, [tickerHistoryCache]);
+
+  // v4: manually trigger a check for this user's enabled Hawkeye cards
+  const runHawkeyeCheckForCard = async (cardId) => {
+    setRunningHawkeyeCheck(prev => ({ ...prev, [cardId]: true }));
+    setHawkeyeCheckResult(prev => ({ ...prev, [cardId]: null }));
+    try {
+      const result = await runHawkeyeCheckNow();
+      // Refresh cards (might have new hits) and ticker history (might have new candle)
+      const fresh = await loadHawkeyeCards();
+      setHawkeyeCards(fresh);
+      const card = fresh.find(c => c.id === cardId);
+      if (card && card.tickers) {
+        const newHistory = await loadTickerHistory(card.tickers);
+        setTickerHistoryCache(prev => ({ ...prev, ...newHistory }));
+      }
+      setHawkeyeCheckResult(prev => ({ ...prev, [cardId]: result }));
+    } catch (e) {
+      setHawkeyeCheckResult(prev => ({ ...prev, [cardId]: { error: e.message || String(e) } }));
+    } finally {
+      setRunningHawkeyeCheck(prev => ({ ...prev, [cardId]: false }));
+    }
+  };
 
   const markHawkeyeHitRead = async (cardId, hitId) => {
     const card = hawkeyeCards.find(c => c.id === cardId);
@@ -2790,6 +2892,88 @@ export default function App() {
                           </div>
                         </div>
 
+                        {/* v4: DATA STATUS PANEL — visible per-ticker chart + run-now button */}
+                        {isOpen && (
+                          <div className="border-t px-5 py-4" style={{ borderColor: "#f0f0ec", background: "#fafaf7" }} onClick={e => e.stopPropagation()}>
+                            <div className="flex items-center justify-between mb-3">
+                              <div className="flex items-center gap-2">
+                                <Activity size={11} style={{ color: "#7c3aed" }} />
+                                <span className="text-[11px] font-semibold tracking-widest uppercase opacity-60">Data status</span>
+                              </div>
+                              <button onClick={() => runHawkeyeCheckForCard(card.id)}
+                                disabled={runningHawkeyeCheck[card.id]}
+                                className="text-[11px] font-medium px-2.5 py-1 rounded-md flex items-center gap-1 transition disabled:opacity-50 text-white"
+                                style={{ background: "#1a1a1a" }}>
+                                {runningHawkeyeCheck[card.id]
+                                  ? <><RefreshCw size={10} className="animate-spin" /> Checking…</>
+                                  : <><RefreshCw size={10} /> Run check now</>}
+                              </button>
+                            </div>
+
+                            {/* Result toast */}
+                            {hawkeyeCheckResult[card.id] && !runningHawkeyeCheck[card.id] && (
+                              <div className="mb-3 text-[11px] px-3 py-2 rounded-lg" style={{
+                                background: hawkeyeCheckResult[card.id].error ? "#fee2e2" : "#dcfce7",
+                                color:      hawkeyeCheckResult[card.id].error ? "#991b1b" : "#166534",
+                              }}>
+                                {hawkeyeCheckResult[card.id].error
+                                  ? `Error: ${hawkeyeCheckResult[card.id].error}`
+                                  : `Updated ${hawkeyeCheckResult[card.id].updated ?? 0} tickers · ${hawkeyeCheckResult[card.id].fired ?? 0} new hit${hawkeyeCheckResult[card.id].fired === 1 ? "" : "s"}${hawkeyeCheckResult[card.id].skipped_quote_not_today > 0 ? ` · ${hawkeyeCheckResult[card.id].skipped_quote_not_today} skipped (market closed today)` : ""}`}
+                              </div>
+                            )}
+
+                            <div className="space-y-2">
+                              {(card.tickers || []).map(t => {
+                                const hist     = tickerHistoryCache[t];
+                                const chartKey = `${card.id}_${t}`;
+                                const isExpand = !!expandedTickerChart[chartKey];
+                                const lastTs   = hist?.last_close_ts ? Number(hist.last_close_ts) : null;
+                                const candleN  = hist?.candles?.length || 0;
+                                const lastDate = lastTs ? new Date(lastTs) : null;
+                                const daysAgo  = lastDate ? Math.floor((Date.now() - lastDate.getTime()) / 86400000) : null;
+                                const isStale  = daysAgo != null && daysAgo > 5;
+                                const isFresh  = daysAgo != null && daysAgo <= 4;
+                                const isReady  = hist?.bootstrapped;
+                                const livePx   = quotes[t]?.c || 0;
+
+                                return (
+                                  <div key={t}>
+                                    <button onClick={() => toggleTickerChartExpand(card.id, t)}
+                                      className="w-full flex items-center justify-between gap-2 px-3 py-2 rounded-lg hover:bg-gray-50 transition"
+                                      style={{ background: "white", border: "1px solid #ececec" }}>
+                                      <div className="flex items-center gap-2 min-w-0 flex-wrap">
+                                        <span className="text-xs font-bold px-2 py-0.5 rounded-md flex-shrink-0" style={{ background: "#f0f0ec" }}>${t}</span>
+                                        {isReady ? (
+                                          <>
+                                            <span className="text-[11px]" style={{ color: isStale ? "#dc2626" : isFresh ? "#059669" : "#525252" }}>
+                                              Last close: {lastDate.toISOString().slice(0, 10)} ({daysAgo === 0 ? "today" : daysAgo === 1 ? "1d ago" : `${daysAgo}d ago`})
+                                            </span>
+                                            <span className="text-[11px] opacity-30">·</span>
+                                            <span className="text-[11px] opacity-50">{candleN} candle{candleN === 1 ? "" : "s"}</span>
+                                            {isStale && (
+                                              <span className="text-[10px] font-semibold px-1.5 py-0.5 rounded-full" style={{ background: "#fee2e2", color: "#991b1b" }}>STALE</span>
+                                            )}
+                                          </>
+                                        ) : (
+                                          <span className="text-[11px] opacity-50 italic flex items-center gap-1">
+                                            <RefreshCw size={9} className="animate-spin" /> Awaiting bootstrap…
+                                          </span>
+                                        )}
+                                      </div>
+                                      <ChevronDown size={11} className="opacity-50 flex-shrink-0" style={{ transform: isExpand ? "rotate(0deg)" : "rotate(-90deg)", transition: "transform 0.15s" }} />
+                                    </button>
+                                    {isExpand && (
+                                      <div className="mt-2 p-3 rounded-lg" style={{ background: "white", border: "1px solid #ececec" }}>
+                                        <HawkeyeMiniChart ticker={t} candles={hist?.candles || []} livePrice={livePx} />
+                                      </div>
+                                    )}
+                                  </div>
+                                );
+                              })}
+                            </div>
+                          </div>
+                        )}
+
                         {/* HITS LIST */}
                         {isOpen && (
                           <div className="border-t" style={{ borderColor: "#f0f0ec" }}>
@@ -2871,3 +3055,4 @@ export default function App() {
     </div>
   );
 }
+
