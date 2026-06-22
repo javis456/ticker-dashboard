@@ -1,7 +1,8 @@
 // Vercel serverless function: POST /api/tag-news
-// Receives up to ~30 headlines, returns tags for each.
-// Your ANTHROPIC_API_KEY is set as a server-side env var in Vercel
-// (NOT VITE_ prefixed, so it never reaches the browser).
+// Receives up to ~50 headlines, returns tags for each.
+// Uses the user-selected SIMPLE model (default: Anthropic Haiku 4.5).
+
+import { callLLM, isAnthropic, DEFAULT_SIMPLE_MODEL } from '../lib/llm.js';
 
 const TAG_DEFINITIONS = `
 Available tags and their definitions:
@@ -25,24 +26,16 @@ Rules:
 `;
 
 export default async function handler(req, res) {
-  if (req.method !== 'POST') {
-    return res.status(405).json({ error: 'Method not allowed' });
-  }
+  if (req.method !== 'POST') return res.status(405).json({ error: 'Method not allowed' });
 
-  const { headlines } = req.body || {};
+  const { headlines, model } = req.body || {};
   if (!Array.isArray(headlines) || headlines.length === 0) {
     return res.status(400).json({ error: 'headlines array required' });
   }
-  if (headlines.length > 50) {
-    return res.status(400).json({ error: 'max 50 headlines per call' });
-  }
+  if (headlines.length > 50) return res.status(400).json({ error: 'max 50 headlines per call' });
 
-  const apiKey = process.env.ANTHROPIC_API_KEY;
-  if (!apiKey) {
-    return res.status(500).json({ error: 'ANTHROPIC_API_KEY not configured' });
-  }
+  const selectedModel = model || DEFAULT_SIMPLE_MODEL;
 
-  // Build a numbered list. AI returns JSON indexed by the same numbers.
   const numbered = headlines.map((h, i) => `${i + 1}. ${h}`).join('\n');
 
   const prompt = `${TAG_DEFINITIONS}
@@ -56,49 +49,38 @@ Headlines:
 ${numbered}`;
 
   try {
-    const response = await fetch('https://api.anthropic.com/v1/messages', {
-      method: 'POST',
-      headers: {
-        'Content-Type': 'application/json',
-        'x-api-key': apiKey,
-        'anthropic-version': '2023-06-01',
-      },
-      body: JSON.stringify({
-        model: 'claude-haiku-4-5-20251001', // Cheapest + fastest, perfect for classification
-        max_tokens: 2000,
-        messages: [{ role: 'user', content: prompt }],
-      }),
+    const llmResult = await callLLM({
+      model: selectedModel,
+      messages: [{ role: 'user', content: prompt }],
+      max_tokens: 2000,
+      // For DeepSeek, JSON mode helps ensure structured output.
+      // For Anthropic, prompt is strong enough — no JSON mode needed.
+      responseFormatJson: !isAnthropic(selectedModel),
+      temperature: 0.2,
     });
 
-    if (!response.ok) {
-      const errText = await response.text();
-      console.error('Anthropic API error:', response.status, errText);
-      return res.status(502).json({ error: 'Tagging failed', details: errText });
-    }
-
-    const data = await response.json();
-    const text = data.content?.map(c => c.text || '').join('').trim() || '';
-
-    // Strip markdown code fences if Claude wrapped the JSON
+    const text = llmResult.text || '';
     const clean = text.replace(/^```(?:json)?\s*/i, '').replace(/```\s*$/, '').trim();
 
     let parsed;
     try {
       parsed = JSON.parse(clean);
     } catch {
-      console.error('JSON parse failed. Raw response:', text);
-      return res.status(502).json({ error: 'Could not parse tagging response' });
+      console.error('JSON parse failed. Raw response:', text.slice(0, 500));
+      return res.status(502).json({ error: 'Could not parse tagging response', model: selectedModel });
     }
 
-    // Map numbered keys back to headline indices (0-based)
     const result = {};
     headlines.forEach((h, i) => {
       result[i] = parsed[String(i + 1)] || ['Other'];
     });
 
-    res.status(200).json({ tags: result });
+    res.status(200).json({
+      tags: result,
+      meta: { model: selectedModel, provider: llmResult.provider },
+    });
   } catch (e) {
-    console.error('Handler error:', e);
-    res.status(500).json({ error: String(e.message || e) });
+    console.error('tag-news error:', e);
+    res.status(500).json({ error: String(e.message || e), model: selectedModel });
   }
 }
