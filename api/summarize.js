@@ -1,5 +1,7 @@
 // Vercel serverless function: POST /api/summarize
-// Generates a structured summary using Claude Sonnet.
+// Generates a structured summary using the user-selected complex model.
+
+import { callLLM, estimateCost, isAnthropic, DEFAULT_COMPLEX_MODEL } from '../lib/llm.js';
 
 const SYSTEM_INSTRUCTIONS = `You are a financial news analyst writing a structured summary for a personal stock dashboard.
 
@@ -45,20 +47,13 @@ RULES:
 - If topic is custom, tilt analysis toward the custom topic while keeping standard sections.
 - Output must be parseable JSON. No trailing commas, no comments, no markdown fences.`;
 
-// ─── Strip citation/source XML tags from any string value in the parsed JSON ──
-// Claude's web search sometimes wraps claims with <cite index="..."> tags.
-// We want to keep the claim text but drop the tags entirely.
 function cleanCitations(value) {
   if (typeof value === 'string') {
     return value
-      // Remove <cite index="...">text</cite> wrappers, keep inner text
       .replace(/<cite\s+[^>]*>([\s\S]*?)<\/cite>/gi, '$1')
-      // Remove any orphan <cite ...> opening or </cite> closing tags
       .replace(/<\/?cite[^>]*>/gi, '')
-      // Same defensive treatment for <source>, <ref>, <citation> if they ever appear
       .replace(/<(source|ref|citation)\s+[^>]*>([\s\S]*?)<\/\1>/gi, '$2')
       .replace(/<\/?(source|ref|citation)[^>]*>/gi, '')
-      // Collapse any double spaces left behind
       .replace(/\s{2,}/g, ' ')
       .trim();
   }
@@ -71,7 +66,6 @@ function cleanCitations(value) {
   return value;
 }
 
-// ─── Robust JSON extraction ───────────────────────────────────────────────────
 function extractJSON(text) {
   if (!text) return null;
   try { return JSON.parse(text.trim()); } catch {}
@@ -97,15 +91,12 @@ function extractJSON(text) {
   return null;
 }
 
-// ─── Salvage partial JSON when response was truncated ─────────────────────────
 function salvageTruncatedJSON(text) {
   if (!text) return null;
   const firstBrace = text.indexOf('{');
   if (firstBrace === -1) return null;
   let s = text.slice(firstBrace);
-
-  let depth = 0, inString = false, escape = false;
-  let lastSafeEnd = -1;
+  let depth = 0, inString = false, escape = false, lastSafeEnd = -1;
   for (let i = 0; i < s.length; i++) {
     const c = s[i];
     if (escape) { escape = false; continue; }
@@ -116,10 +107,8 @@ function salvageTruncatedJSON(text) {
     else if (c === '}' || c === ']') depth--;
     if (!inString && (c === ',' || c === '}' || c === ']')) lastSafeEnd = i + 1;
   }
-
   if (lastSafeEnd === -1) return null;
   let trimmed = s.slice(0, lastSafeEnd).replace(/,\s*$/, '');
-
   let openBraces = 0, openBrackets = 0;
   inString = false; escape = false;
   for (const c of trimmed) {
@@ -134,11 +123,9 @@ function salvageTruncatedJSON(text) {
   }
   while (openBrackets > 0) { trimmed += ']'; openBrackets--; }
   while (openBraces   > 0) { trimmed += '}'; openBraces--;   }
-
   try { return JSON.parse(trimmed); } catch { return null; }
 }
 
-// ─── Token budget planning ────────────────────────────────────────────────────
 function planTokenBudget(period, topic, newsCount) {
   let budget = 2000;
   if (period === '1m')     budget += 800;
@@ -151,21 +138,20 @@ function planTokenBudget(period, topic, newsCount) {
   return Math.min(budget, 6000);
 }
 
-// ─── Main handler ─────────────────────────────────────────────────────────────
 export default async function handler(req, res) {
   if (req.method !== 'POST') return res.status(405).json({ error: 'POST only' });
 
-  const apiKey = process.env.ANTHROPIC_API_KEY;
-  if (!apiKey) return res.status(500).json({ error: 'ANTHROPIC_API_KEY missing' });
-
   const {
     ticker, period, periodLabel, fromDate, toDate,
-    topic, customTopic, priceContext, newsItems = []
+    topic, customTopic, priceContext, newsItems = [],
+    model,    // NEW: user-selected model from client
   } = req.body || {};
 
   if (!ticker || !period || !fromDate || !toDate) {
     return res.status(400).json({ error: 'ticker, period, fromDate, toDate required' });
   }
+
+  const selectedModel = model || DEFAULT_COMPLEX_MODEL;
 
   const newsBlock = newsItems.length === 0
     ? "(No news items provided from Finnhub for this period.)"
@@ -186,7 +172,12 @@ URL: ${n.url || 'N/A'}`
     ? `Price context: started at $${priceContext.startPx?.toFixed(2)}, ended at $${priceContext.endPx?.toFixed(2)} (${priceContext.pctChange > 0 ? '+' : ''}${priceContext.pctChange?.toFixed(2)}%). High: $${priceContext.high?.toFixed(2)}, Low: $${priceContext.low?.toFixed(2)}.`
     : 'Price context: unavailable.';
 
-  const enableWebSearch = ['1m', '1q', 'custom'].includes(period);
+  // Web search is only available with Anthropic models
+  const enableWebSearch = isAnthropic(selectedModel) && ['1m', '1q', 'custom'].includes(period);
+
+  const webHint = enableWebSearch
+    ? 'You may use web_search up to 3 times for additional context.'
+    : 'Use only the news provided above.';
 
   const userMessage = `Summarize ${ticker} for ${fromDate} to ${toDate} (${periodLabel}).
 
@@ -197,103 +188,68 @@ ${priceLine}
 News items from Finnhub:
 ${newsBlock}
 
-${enableWebSearch ? 'You may use web_search up to 3 times for additional context.' : 'Use only the news provided above.'}
+${webHint}
 
 Output the JSON summary now. Be CONCISE — short descriptions, dense facts. Your response MUST start with { and end with }. No code fences. NO XML tags inside string values.`;
-
-  const tools = enableWebSearch ? [{
-    type: 'web_search_20250305',
-    name: 'web_search',
-    max_uses: 3,
-  }] : undefined;
 
   const maxTokens = planTokenBudget(period, topic, newsItems.length);
 
   try {
-    const body = {
-      model: 'claude-sonnet-4-5-20250929',
-      max_tokens: maxTokens,
-      system: [
-        { type: 'text', text: SYSTEM_INSTRUCTIONS, cache_control: { type: 'ephemeral' } }
-      ],
+    const llmResult = await callLLM({
+      model: selectedModel,
+      system: SYSTEM_INSTRUCTIONS,
       messages: [{ role: 'user', content: userMessage }],
-    };
-    if (tools) body.tools = tools;
-
-    const response = await fetch('https://api.anthropic.com/v1/messages', {
-      method: 'POST',
-      headers: {
-        'Content-Type': 'application/json',
-        'x-api-key': apiKey,
-        'anthropic-version': '2023-06-01',
-      },
-      body: JSON.stringify(body),
+      max_tokens: maxTokens,
+      enableCaching: isAnthropic(selectedModel),    // Anthropic-only optimization
+      webSearchMaxUses: enableWebSearch ? 3 : 0,    // Anthropic-only
+      responseFormatJson: !isAnthropic(selectedModel), // DeepSeek/OpenAI-compatible JSON mode
     });
 
-    if (!response.ok) {
-      const errText = await response.text();
-      console.error('Anthropic error:', response.status, errText);
-      return res.status(502).json({ error: 'Anthropic API call failed', details: errText });
-    }
-
-    const data = await response.json();
-    const stopReason = data.stop_reason;
-
-    const allText = data.content
-      ?.filter(c => c.type === 'text')
-      .map(c => c.text || '')
-      .join('\n')
-      .trim() || '';
-
-    let parsed = extractJSON(allText);
+    const { text, stopReason, usage, searchUses } = llmResult;
+    let parsed = extractJSON(text);
     let wasSalvaged = false;
     if (!parsed && stopReason === 'max_tokens') {
-      parsed = salvageTruncatedJSON(allText);
+      parsed = salvageTruncatedJSON(text);
       if (parsed) wasSalvaged = true;
     }
 
     if (!parsed) {
-      console.error('JSON extraction failed. stop_reason:', stopReason, 'Raw:', allText.slice(0, 800));
+      console.error('JSON extraction failed. stop_reason:', stopReason, 'Raw:', text.slice(0, 800));
       return res.status(502).json({
         error: stopReason === 'max_tokens'
           ? `Response exceeded token budget (${maxTokens}). Try a shorter period or simpler topic.`
           : 'Could not parse summary response',
         stopReason,
         maxTokensUsed: maxTokens,
-        rawPreview: allText.slice(0, 1000),
+        rawPreview: text.slice(0, 1000),
+        model: selectedModel,
       });
     }
 
-    // Strip citation/source XML tags from all string values
     parsed = cleanCitations(parsed);
 
-    const usage = data.usage || {};
-    const inputTokens         = usage.input_tokens || 0;
-    const cachedInputTokens   = usage.cache_read_input_tokens || 0;
-    const cacheCreateTokens   = usage.cache_creation_input_tokens || 0;
-    const outputTokens        = usage.output_tokens || 0;
-    const searchUses          = data.content?.filter(c => c.type === 'server_tool_use').length || 0;
-
-    const inputCost       = (inputTokens / 1_000_000) * 3.0;
-    const cachedCost      = (cachedInputTokens / 1_000_000) * 0.30;
-    const cacheCreateCost = (cacheCreateTokens / 1_000_000) * 3.75;
-    const outputCost      = (outputTokens / 1_000_000) * 15.0;
-    const searchCost      = searchUses * 0.01;
-    const totalCost       = inputCost + cachedCost + cacheCreateCost + outputCost + searchCost;
+    const costUSD = estimateCost(selectedModel, usage, searchUses);
 
     res.status(200).json({
       summary: parsed,
       meta: {
-        tokens:    { input: inputTokens, cached: cachedInputTokens, output: outputTokens, cacheCreate: cacheCreateTokens },
-        searches:  searchUses,
-        costUSD:   Number(totalCost.toFixed(4)),
+        model:    selectedModel,
+        provider: llmResult.provider,
+        tokens:   {
+          input:       usage.input_tokens,
+          cached:      usage.cache_read_input_tokens,
+          output:      usage.output_tokens,
+          cacheCreate: usage.cache_creation_input_tokens,
+        },
+        searches: searchUses,
+        costUSD,
         stopReason,
         maxTokensUsed: maxTokens,
-        salvaged:  wasSalvaged,
+        salvaged: wasSalvaged,
       }
     });
   } catch (e) {
-    console.error('Handler error:', e);
-    res.status(500).json({ error: String(e.message || e) });
+    console.error('summarize error:', e);
+    res.status(500).json({ error: String(e.message || e), model: selectedModel });
   }
 }
