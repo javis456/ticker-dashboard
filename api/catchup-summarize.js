@@ -1,10 +1,7 @@
 // Vercel serverless function: POST /api/catchup-summarize
-// Generates a structured catchup summary for a Catchup card.
-//
-// Inputs: card definition (name, type, tickers, topics, key_interests, routine)
-// Plus pre-fetched news from Finnhub for the relevant tickers
-//
-// Output: structured JSON with sections tuned for habit-building catchup
+// Generates a structured catchup briefing using the user-selected complex model.
+
+import { callLLM, estimateCost, isAnthropic, DEFAULT_COMPLEX_MODEL } from '../lib/llm.js';
 
 const SYSTEM_INSTRUCTIONS = `You are a financial news analyst writing a catchup briefing for a personal stock dashboard. The user has set up a recurring routine to stay caught up on specific stocks and/or topics.
 
@@ -48,7 +45,6 @@ CONTENT RULES:
 - Plain text inside string values — NO XML tags like <cite> or <source>
 - No trailing commas. No markdown fences. Just JSON.`;
 
-// ─── Strip citation tags ──────────────────────────────────────────────────────
 function cleanCitations(value) {
   if (typeof value === 'string') {
     return value
@@ -68,7 +64,6 @@ function cleanCitations(value) {
   return value;
 }
 
-// ─── JSON extraction & salvage ────────────────────────────────────────────────
 function extractJSON(text) {
   if (!text) return null;
   try { return JSON.parse(text.trim()); } catch {}
@@ -99,8 +94,7 @@ function salvageTruncatedJSON(text) {
   const firstBrace = text.indexOf('{');
   if (firstBrace === -1) return null;
   let s = text.slice(firstBrace);
-  let depth = 0, inString = false, escape = false;
-  let lastSafeEnd = -1;
+  let depth = 0, inString = false, escape = false, lastSafeEnd = -1;
   for (let i = 0; i < s.length; i++) {
     const c = s[i];
     if (escape) { escape = false; continue; }
@@ -130,13 +124,11 @@ function salvageTruncatedJSON(text) {
   try { return JSON.parse(trimmed); } catch { return null; }
 }
 
-// ─── Token budget ─────────────────────────────────────────────────────────────
 function planTokenBudget({ routineUnit, type, tickerCount, topicCount }) {
   let budget = 1800;
   if (routineUnit === 'week')  budget += 600;
   if (routineUnit === 'month') budget += 1400;
   if (type === 'stocks_and_topics') budget += 400;
-  // More entities → potentially more updates
   budget += Math.min(tickerCount * 100, 600);
   budget += Math.min(topicCount  * 150, 600);
   return Math.min(budget, 5500);
@@ -149,37 +141,27 @@ function periodToDays(value, unit) {
   return value;
 }
 
-// ─── Main handler ─────────────────────────────────────────────────────────────
 export default async function handler(req, res) {
   if (req.method !== 'POST') return res.status(405).json({ error: 'POST only' });
 
-  const apiKey = process.env.ANTHROPIC_API_KEY;
-  if (!apiKey) return res.status(500).json({ error: 'ANTHROPIC_API_KEY missing' });
-
   const {
-    cardName,
-    type,                // 'stocks' | 'topics' | 'stocks_and_topics'
-    tickers = [],
-    topics = [],
-    keyInterests = '',
-    routineValue = 1,
-    routineUnit = 'week',
-    fromDate, toDate,
-    newsByTicker = {},   // { TICKER: [news items] }
+    cardName, type, tickers = [], topics = [], keyInterests = '',
+    routineValue = 1, routineUnit = 'week',
+    fromDate, toDate, newsByTicker = {},
+    model,   // NEW
   } = req.body || {};
 
   if (!type || !fromDate || !toDate) {
     return res.status(400).json({ error: 'type, fromDate, toDate required' });
   }
 
-  // Build the news block — group news by ticker for clarity
+  const selectedModel = model || DEFAULT_COMPLEX_MODEL;
+
   let newsBlock = '(no news provided)';
   const allNews = Object.entries(newsByTicker).flatMap(([tk, items]) =>
     (items || []).map(n => ({ ...n, ticker: tk }))
   );
-
   if (allNews.length > 0) {
-    // Cap total news items to keep prompt size bounded
     const capped = allNews.slice(0, 40);
     newsBlock = capped.map((n, i) =>
       `[${i + 1}] ${new Date((n.datetime || 0) * 1000).toISOString().slice(0, 10)} | $${n.ticker} | ${n.source || 'Unknown'}
@@ -189,7 +171,6 @@ URL: ${n.url || 'N/A'}`
     ).join('\n\n');
   }
 
-  // Build the focus directive based on type
   let focusBlock = '';
   if (type === 'stocks') {
     focusBlock = `FOCUS: Stocks only. Cover news about these tickers: ${tickers.join(', ')}.`;
@@ -204,8 +185,12 @@ URL: ${n.url || 'N/A'}`
   }
 
   const periodDays = periodToDays(routineValue, routineUnit);
-  // Enable web search for topic-heavy queries or longer periods
-  const enableWebSearch = type !== 'stocks' || periodDays >= 14;
+  // Web search only available with Anthropic models
+  const enableWebSearch = isAnthropic(selectedModel) && (type !== 'stocks' || periodDays >= 14);
+
+  const webHint = enableWebSearch
+    ? 'You MAY use web_search up to 3 times to find topic-relevant news or fill gaps.'
+    : 'Use ONLY the news provided above.';
 
   const userMessage = `Generate a "${cardName}" catchup briefing for ${fromDate} → ${toDate} (a ${routineValue}-${routineUnit} routine).
 
@@ -214,15 +199,9 @@ ${focusBlock}
 News items from Finnhub for the relevant tickers (may be empty if topic-only):
 ${newsBlock}
 
-${enableWebSearch ? 'You MAY use web_search up to 3 times to find topic-relevant news or fill gaps.' : 'Use ONLY the news provided above.'}
+${webHint}
 
 Output the JSON briefing now. Be CONCISE and SPECIFIC. NO XML tags inside string values. Start with { end with }.`;
-
-  const tools = enableWebSearch ? [{
-    type: 'web_search_20250305',
-    name: 'web_search',
-    max_uses: 3,
-  }] : undefined;
 
   const maxTokens = planTokenBudget({
     routineUnit, type,
@@ -231,87 +210,56 @@ Output the JSON briefing now. Be CONCISE and SPECIFIC. NO XML tags inside string
   });
 
   try {
-    const body = {
-      model: 'claude-sonnet-4-5-20250929',
-      max_tokens: maxTokens,
-      system: [
-        { type: 'text', text: SYSTEM_INSTRUCTIONS, cache_control: { type: 'ephemeral' } }
-      ],
+    const llmResult = await callLLM({
+      model: selectedModel,
+      system: SYSTEM_INSTRUCTIONS,
       messages: [{ role: 'user', content: userMessage }],
-    };
-    if (tools) body.tools = tools;
-
-    const response = await fetch('https://api.anthropic.com/v1/messages', {
-      method: 'POST',
-      headers: {
-        'Content-Type': 'application/json',
-        'x-api-key': apiKey,
-        'anthropic-version': '2023-06-01',
-      },
-      body: JSON.stringify(body),
+      max_tokens: maxTokens,
+      enableCaching: isAnthropic(selectedModel),
+      webSearchMaxUses: enableWebSearch ? 3 : 0,
+      responseFormatJson: !isAnthropic(selectedModel),
     });
 
-    if (!response.ok) {
-      const errText = await response.text();
-      console.error('Anthropic error:', response.status, errText);
-      return res.status(502).json({ error: 'Anthropic call failed', details: errText });
-    }
-
-    const data = await response.json();
-    const stopReason = data.stop_reason;
-
-    const allText = data.content
-      ?.filter(c => c.type === 'text')
-      .map(c => c.text || '')
-      .join('\n')
-      .trim() || '';
-
-    let parsed = extractJSON(allText);
+    const { text, stopReason, usage, searchUses } = llmResult;
+    let parsed = extractJSON(text);
     let salvaged = false;
     if (!parsed && stopReason === 'max_tokens') {
-      parsed = salvageTruncatedJSON(allText);
+      parsed = salvageTruncatedJSON(text);
       if (parsed) salvaged = true;
     }
-
     if (!parsed) {
       return res.status(502).json({
         error: stopReason === 'max_tokens'
           ? `Response exceeded token budget (${maxTokens}). Try a shorter routine or fewer tickers/topics.`
           : 'Could not parse catchup response',
         stopReason, maxTokensUsed: maxTokens,
-        rawPreview: allText.slice(0, 1000),
+        rawPreview: text.slice(0, 1000),
+        model: selectedModel,
       });
     }
-
     parsed = cleanCitations(parsed);
 
-    // Cost reporting
-    const usage = data.usage || {};
-    const inputCost       = ((usage.input_tokens || 0) / 1_000_000) * 3.0;
-    const cachedCost      = ((usage.cache_read_input_tokens || 0) / 1_000_000) * 0.30;
-    const cacheCreateCost = ((usage.cache_creation_input_tokens || 0) / 1_000_000) * 3.75;
-    const outputCost      = ((usage.output_tokens || 0) / 1_000_000) * 15.0;
-    const searches        = data.content?.filter(c => c.type === 'server_tool_use').length || 0;
-    const searchCost      = searches * 0.01;
-    const totalCost       = inputCost + cachedCost + cacheCreateCost + outputCost + searchCost;
+    const costUSD = estimateCost(selectedModel, usage, searchUses);
 
     res.status(200).json({
       briefing: parsed,
       meta: {
+        model:    selectedModel,
+        provider: llmResult.provider,
         tokens: {
-          input:       usage.input_tokens || 0,
-          cached:      usage.cache_read_input_tokens || 0,
-          cacheCreate: usage.cache_creation_input_tokens || 0,
-          output:      usage.output_tokens || 0,
+          input:       usage.input_tokens,
+          cached:      usage.cache_read_input_tokens,
+          cacheCreate: usage.cache_creation_input_tokens,
+          output:      usage.output_tokens,
         },
-        searches,
-        costUSD: Number(totalCost.toFixed(4)),
+        searches: searchUses,
+        costUSD,
         stopReason,
         salvaged,
       }
     });
   } catch (e) {
-    console.error(e);
-    res.status(500).json({ error: String(e.message || e) });
+    console.error('catchup-summarize error:', e);
+    res.status(500).json({ error: String(e.message || e), model: selectedModel });
   }
 }
