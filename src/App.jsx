@@ -7,7 +7,8 @@ import {
   BellRing, Mail, DollarSign, AlertCircle as AlertCircleIcon, Power,
   CalendarClock, Repeat, BookOpen, Lightbulb, ListChecks,
   Eye as EyeIcon, Crosshair, ArrowUpRight, ArrowDownRight, Activity,
-  ClipboardPaste, FileUp
+  ClipboardPaste, FileUp,
+  Settings, Cpu
 } from "lucide-react";
 import { AreaChart, Area, XAxis, YAxis, Tooltip, ResponsiveContainer } from "recharts";
 import { getQuote, getProfile, getNews, getCandles, classifyImpact, timeAgo } from "./lib/finnhub";
@@ -17,6 +18,7 @@ import { loadSummaries, saveSummary, deleteSummary, generateSummary } from "./li
 import { loadUserEmail, saveUserEmail, loadAlerts, createAlert, stopAlert, deleteAlert } from "./lib/alerts";
 import { loadCatchupCards, saveCatchupCard, deleteCatchupCard, generateCatchupBriefing, computeDueState, periodToDays } from "./lib/catchup";
 import { loadHawkeyeCards, saveHawkeyeCard, deleteHawkeyeCard, describeCondition, registerTickersForBootstrap, loadBootstrapStatus, saveTickerHistory, loadTickerHistory, runHawkeyeCheckNow } from "./lib/hawkeye";
+import { loadModelPrefs, saveModelPrefs, loadAvailableProviders, labelForModel, DEFAULT_COMPLEX_MODEL, DEFAULT_SIMPLE_MODEL } from "./lib/model-prefs";
 import { parseHistoricalPaste } from "./lib/parseHistoricalPaste";
 
 const DEFAULT_STATE = {
@@ -299,6 +301,121 @@ function SyncModal({ onClose }) {
         <div className="flex gap-2 mt-4">
           <button onClick={apply} className="flex-1 py-2 rounded-md text-white text-sm" style={{ background: "#1a1a1a" }}>Use this ID</button>
           <button onClick={onClose} className="px-4 py-2 rounded-md text-sm" style={{ background: "#f0f0ec" }}>Close</button>
+        </div>
+      </div>
+    </div>
+  );
+}
+
+function SettingsModal({ modelPrefs, settingsDraft, setSettingsDraft, availableProviders, providersLoading, settingsSaving, onRefresh, onSave, onClose }) {
+  const { providers = [] } = availableProviders || {};
+
+  // Flatten all models into one list with provider context, used to render dropdown options
+  const allModels = providers.flatMap(p =>
+    (p.models || []).map(m => ({ ...m, providerName: p.name, providerConfigured: p.configured }))
+  );
+
+  // Group dropdown options by provider for visual grouping
+  const renderDropdown = (value, onChange, idSuffix) => (
+    <select
+      value={value}
+      onChange={e => onChange(e.target.value)}
+      className="w-full text-sm px-3 py-2 rounded-lg focus:outline-none focus:border-gray-900 transition"
+      style={{ background: "#fafaf7", border: "1px solid #e5e5e5" }}
+      disabled={providersLoading}
+    >
+      {/* Always include the current value even if not in returned list (e.g. provider not configured) */}
+      {value && !allModels.find(m => m.id === value) && (
+        <option value={value}>{labelForModel(value, availableProviders)} (current)</option>
+      )}
+      {providers.map(p => (
+        p.models && p.models.length > 0 ? (
+          <optgroup key={p.id + idSuffix} label={p.name}>
+            {p.models.map(m => (
+              <option key={m.id} value={m.id}>{m.display_name}</option>
+            ))}
+          </optgroup>
+        ) : null
+      ))}
+    </select>
+  );
+
+  const setComplex = (v) => setSettingsDraft(d => ({ ...d, complex_model: v }));
+  const setSimple  = (v) => setSettingsDraft(d => ({ ...d, simple_model:  v }));
+
+  const dirty = settingsDraft.complex_model !== modelPrefs.complex_model ||
+                settingsDraft.simple_model  !== modelPrefs.simple_model;
+
+  return (
+    <div onClick={onClose} className="fixed inset-0 z-50 flex items-center justify-center p-4" style={{ background: "rgba(0,0,0,0.4)" }}>
+      <div onClick={e => e.stopPropagation()} className="w-full max-w-lg rounded-2xl p-6 fade-in max-h-[90vh] overflow-y-auto" style={{ background: "white" }}>
+        <div className="flex items-center justify-between mb-1">
+          <h3 className="font-serif-h text-xl font-semibold">Settings</h3>
+          <button onClick={onClose} className="p-1 opacity-50 hover:opacity-100"><X size={16} /></button>
+        </div>
+        <p className="text-sm opacity-60 mb-5">Choose which AI model handles different types of tasks.</p>
+
+        <div className="mb-4 p-4 rounded-xl" style={{ background: "#fafaf7", border: "1px solid #f0f0ec" }}>
+          <div className="flex items-center gap-2 mb-1">
+            <Cpu size={12} style={{ color: "#7c3aed" }} />
+            <span className="text-[11px] font-semibold tracking-widest uppercase opacity-60">AI Models</span>
+          </div>
+
+          {/* Complex task */}
+          <div className="mb-4">
+            <label className="text-sm font-semibold block mt-3">Complex Task Model</label>
+            <p className="text-[11px] opacity-60 mb-2">Used by: <span className="font-medium">Summarize</span>, <span className="font-medium">Catchup briefings</span>. Pick a capable model — these need reasoning, long context, and structured output.</p>
+            {renderDropdown(settingsDraft.complex_model, setComplex, "_complex")}
+          </div>
+
+          {/* Simple task */}
+          <div className="mb-2">
+            <label className="text-sm font-semibold block">Simple Task Model</label>
+            <p className="text-[11px] opacity-60 mb-2">Used by: <span className="font-medium">News tagging</span>. Pick a cheap/fast model — this is high volume, low complexity classification.</p>
+            {renderDropdown(settingsDraft.simple_model, setSimple, "_simple")}
+          </div>
+
+          {/* Provider status notes */}
+          <div className="mt-3 space-y-1">
+            {providers.map(p => (
+              !p.configured ? (
+                <div key={p.id} className="text-[11px] flex items-start gap-1.5 opacity-60">
+                  <AlertCircle size={10} className="flex-shrink-0 mt-0.5" />
+                  <span><span className="font-medium">{p.name}</span> not configured. {p.configure_hint || `Add the relevant API key to your Vercel environment variables.`}</span>
+                </div>
+              ) : p.error ? (
+                <div key={p.id} className="text-[11px] flex items-start gap-1.5" style={{ color: "#dc2626" }}>
+                  <AlertCircle size={10} className="flex-shrink-0 mt-0.5" />
+                  <span><span className="font-medium">{p.name}</span> error: {p.error}</span>
+                </div>
+              ) : null
+            ))}
+          </div>
+
+          <div className="text-[11px] opacity-50 mt-3 pt-3 border-t" style={{ borderColor: "#e5e5e5" }}>
+            <p className="mb-1"><span className="font-semibold">Note:</span> Web search in Summarize and Catchup is only available with Anthropic models. Other providers will rely only on news fetched from Finnhub.</p>
+            <p>Prompt caching discounts are also Anthropic-only.</p>
+          </div>
+
+          <div className="flex justify-end mt-3">
+            <button
+              onClick={onRefresh}
+              disabled={providersLoading}
+              className="text-[11px] flex items-center gap-1 opacity-60 hover:opacity-100 disabled:opacity-30">
+              <RefreshCw size={10} className={providersLoading ? "animate-spin" : ""} /> Refresh model list
+            </button>
+          </div>
+        </div>
+
+        <div className="flex gap-2 mt-5">
+          <button
+            onClick={onSave}
+            disabled={!dirty || settingsSaving}
+            className="flex-1 py-2 rounded-md text-white text-sm font-medium transition disabled:opacity-40"
+            style={{ background: "#1a1a1a" }}>
+            {settingsSaving ? "Saving…" : "Save changes"}
+          </button>
+          <button onClick={onClose} className="px-4 py-2 rounded-md text-sm" style={{ background: "#f0f0ec" }}>Cancel</button>
         </div>
       </div>
     </div>
@@ -648,6 +765,14 @@ export default function App() {
   const [runningHawkeyeCheck, setRunningHawkeyeCheck] = useState({});    // { [cardId]: true }
   const [hawkeyeCheckResult, setHawkeyeCheckResult] = useState({});      // { [cardId]: { updated, fired, errors } }
 
+  // v5: model preferences + provider availability + settings modal
+  const [modelPrefs, setModelPrefs] = useState({ complex_model: DEFAULT_COMPLEX_MODEL, simple_model: DEFAULT_SIMPLE_MODEL });
+  const [availableProviders, setAvailableProviders] = useState({ providers: [] });
+  const [providersLoading, setProvidersLoading] = useState(false);
+  const [showSettings, setShowSettings] = useState(false);
+  const [settingsDraft, setSettingsDraft] = useState({ complex_model: DEFAULT_COMPLEX_MODEL, simple_model: DEFAULT_SIMPLE_MODEL });
+  const [settingsSaving, setSettingsSaving] = useState(false);
+
   // New: per-ticker history paste state during create flow
   const [hkHistoryByTicker, setHkHistoryByTicker] = useState({});
   const [hkCurrentPasteTicker, setHkCurrentPasteTicker] = useState("");
@@ -726,6 +851,8 @@ export default function App() {
           const status = await loadBootstrapStatus(allHkTickers);
           setBootstrapStatus(status);
         }
+        const prefs = await loadModelPrefs();
+        setModelPrefs(prefs);
         setCloudStatus("synced");
       } catch { setCloudStatus("offline"); }
       setHydrated(true);
@@ -733,6 +860,15 @@ export default function App() {
   }, []);
 
   useEffect(() => { if (hydrated) saveState(state); }, [state, hydrated]);
+
+  // v5: lazy-load available model providers shortly after hydration
+  useEffect(() => {
+    if (!hydrated) return;
+    setProvidersLoading(true);
+    loadAvailableProviders().then(data => {
+      setAvailableProviders(data);
+    }).catch(() => {}).finally(() => setProvidersLoading(false));
+  }, [hydrated]);
 
   const allTickers = useMemo(() => {
     const s = new Set();
@@ -828,7 +964,7 @@ export default function App() {
     const untagged = items.filter(it => !tagsByNewsKey[it.key]);
     if (!untagged.length) return;
     setTaggingInProgress(true);
-    tagNews(untagged).then(tags => setTagsByNewsKey(prev => ({ ...prev, ...tags }))).finally(() => setTaggingInProgress(false));
+    tagNews(untagged, modelPrefs.simple_model).then(tags => setTagsByNewsKey(prev => ({ ...prev, ...tags }))).finally(() => setTaggingInProgress(false));
   }, [hydrated, newsByTicker]); // eslint-disable-line
 
   // Watching matches scan
@@ -1367,6 +1503,7 @@ export default function App() {
         routineUnit: card.routine_unit,
         fromDate, toDate,
         newsByTicker,
+        model: modelPrefs.complex_model,
       });
 
       // 4. Append to card's summaries, update last_run_at
@@ -1455,6 +1592,7 @@ export default function App() {
         customTopic: sumCustomTopic,
         priceContext,
         newsItems: periodNews,
+        model: modelPrefs.complex_model,
       });
 
       // 4) Persist
@@ -1545,6 +1683,9 @@ export default function App() {
             <button onClick={() => setShowSync(true)} className="p-1.5 rounded-full hover:bg-gray-100 transition" style={{ color: cloudStatus === "synced" ? "#059669" : cloudStatus === "offline" ? "#dc2626" : "#a3a3a3" }}>
               {cloudStatus === "offline" ? <CloudOff size={14} /> : <Cloud size={14} />}
             </button>
+            <button onClick={() => { setSettingsDraft(modelPrefs); setShowSettings(true); }} className="p-1.5 rounded-full hover:bg-gray-100 transition opacity-60 hover:opacity-100" title="Settings">
+              <Settings size={14} />
+            </button>
             <div className="relative">
               <Search size={14} className="absolute left-3 top-1/2 -translate-y-1/2 opacity-40" />
               <input value={search} onChange={e => setSearch(e.target.value)} placeholder="Search news" className="pl-9 pr-3 py-1.5 text-sm rounded-full border focus:outline-none focus:border-gray-900 transition" style={{ borderColor: "#e5e5e5", background: "white", width: 200 }} />
@@ -1554,6 +1695,32 @@ export default function App() {
       </header>
 
       {showSync && <SyncModal onClose={() => setShowSync(false)} />}
+      {showSettings && (
+        <SettingsModal
+          modelPrefs={modelPrefs}
+          settingsDraft={settingsDraft}
+          setSettingsDraft={setSettingsDraft}
+          availableProviders={availableProviders}
+          providersLoading={providersLoading}
+          settingsSaving={settingsSaving}
+          onRefresh={async () => {
+            setProvidersLoading(true);
+            const data = await loadAvailableProviders(true);
+            setAvailableProviders(data);
+            setProvidersLoading(false);
+          }}
+          onSave={async () => {
+            setSettingsSaving(true);
+            const ok = await saveModelPrefs(settingsDraft.complex_model, settingsDraft.simple_model);
+            if (ok) {
+              setModelPrefs(settingsDraft);
+              setShowSettings(false);
+            }
+            setSettingsSaving(false);
+          }}
+          onClose={() => setShowSettings(false)}
+        />
+      )}
       {confirmDelete && (
         <ConfirmModal
           title={`Remove ${confirmDelete.label}?`}
