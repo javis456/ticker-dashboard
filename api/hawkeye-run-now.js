@@ -1,39 +1,20 @@
 // Vercel serverless function: POST /api/hawkeye-run-now
 //
-// Body: { identity: "..." }
-// Runs the same logic as hawkeye-daily but scoped to ONE user's enabled cards.
-// Useful for: user clicks "Run check now" in the UI to verify/refresh data
-//             without waiting for the 5 PM ET cron.
-//
-// Safety: only appends today's candle if the Finnhub quote is actually from
-// today's NYC trading session (skips weekends, holidays).
+// User-triggered manual check, scoped to ONE identity.
+// Updated to support non-US tickers via the shared lib/quotes.js router.
 
 import { createClient } from '@supabase/supabase-js';
+import { fetchQuote } from '../lib/quotes.js';
+import { getMarket } from '../lib/markets.js';
 
-const FINNHUB_KEY  = process.env.FINNHUB_KEY || process.env.VITE_FINNHUB_KEY;
 const SUPABASE_URL = process.env.SUPABASE_URL || process.env.VITE_SUPABASE_URL;
 const SUPABASE_KEY = process.env.SUPABASE_SERVICE_KEY || process.env.SUPABASE_ANON_KEY || process.env.VITE_SUPABASE_ANON_KEY;
 
 function sleep(ms) { return new Promise(r => setTimeout(r, ms)); }
 
-async function getFinnhubQuote(symbol) {
-  const r = await fetch(`https://finnhub.io/api/v1/quote?symbol=${encodeURIComponent(symbol)}&token=${FINNHUB_KEY}`);
-  if (!r.ok) throw new Error(`Finnhub ${r.status}`);
-  return r.json();
-}
-
-function todayEasternMidnightMs() {
+function marketDateString(ms, timezone) {
   const fmt = new Intl.DateTimeFormat('en-CA', {
-    timeZone: 'America/New_York',
-    year: 'numeric', month: '2-digit', day: '2-digit',
-  });
-  const parts = Object.fromEntries(fmt.formatToParts(new Date()).map(p => [p.type, p.value]));
-  return new Date(`${parts.year}-${parts.month}-${parts.day}T00:00:00Z`).getTime();
-}
-
-function easternDateString(ms) {
-  const fmt = new Intl.DateTimeFormat('en-CA', {
-    timeZone: 'America/New_York',
+    timeZone: timezone,
     year: 'numeric', month: '2-digit', day: '2-digit',
   });
   const parts = Object.fromEntries(fmt.formatToParts(new Date(ms)).map(p => [p.type, p.value]));
@@ -62,23 +43,18 @@ function evaluateCondition(condition, candles, currentPrice) {
   return { triggered, refPrice, refDate: new Date(refTs).toISOString().slice(0, 10), currentPrice, pctChange };
 }
 
-function conditionKey(c) {
-  return [c.direction, c.thresholdPct, c.triggerWindowDays, c.reference].join('|');
-}
+function conditionKey(c) { return [c.direction, c.thresholdPct, c.triggerWindowDays, c.reference].join('|'); }
 
 export default async function handler(req, res) {
   if (req.method !== 'POST') return res.status(405).json({ error: 'POST only' });
-  if (!FINNHUB_KEY || !SUPABASE_URL || !SUPABASE_KEY) {
-    return res.status(500).json({ error: 'env vars missing' });
-  }
+  if (!SUPABASE_URL || !SUPABASE_KEY) return res.status(500).json({ error: 'env missing' });
 
   const { identity } = req.body || {};
   if (!identity) return res.status(400).json({ error: 'identity required' });
 
   const supabase = createClient(SUPABASE_URL, SUPABASE_KEY);
-  const summary = { updated: 0, fired: 0, errors: [], skipped_quote_not_today: 0 };
+  const summary = { updated: 0, fired: 0, errors: [] };
 
-  // Fetch this user's enabled cards
   const { data: cards, error: cErr } = await supabase
     .from('hawkeye_cards').select('*')
     .eq('identity', identity).eq('enabled', true);
@@ -94,56 +70,52 @@ export default async function handler(req, res) {
   const historyByTicker = {};
   (histRows || []).forEach(r => { historyByTicker[r.ticker] = r; });
 
-  const todayMs = todayEasternMidnightMs();
-  const todayDateStr = easternDateString(Date.now());
   const quotes = {};
 
   for (const tk of uniqueTickers) {
     try {
-      const q = await getFinnhubQuote(tk);
+      const market = getMarket(tk);
+      if (!market) { summary.errors.push(`unknown market for ${tk}`); continue; }
+
+      const q = await fetchQuote(tk);
       if (!q || !q.c) continue;
       quotes[tk] = q.c;
 
       const histRow = historyByTicker[tk];
       if (!histRow || !histRow.bootstrapped) continue;
 
-      // Only append if quote is from today's NYC trading session
-      const quoteTs = (q.t || 0) * 1000;
-      if (quoteTs > 0) {
-        const quoteDateStr = easternDateString(quoteTs);
-        if (quoteDateStr !== todayDateStr) {
-          summary.skipped_quote_not_today++;
-          continue;
-        }
-      }
+      const quoteMs = (q.t || 0) * 1000 || Date.now();
+      const candleDateStr = marketDateString(quoteMs, market.timezone);
+      const candleMs = new Date(candleDateStr + 'T00:00:00Z').getTime();
 
       const candles = histRow.candles || [];
-      const existingIdx = candles.findIndex(c => c.ts === todayMs);
+      const existingIdx = candles.findIndex(c => c.ts === candleMs);
       const newCandle = {
-        ts: todayMs,
+        ts: candleMs,
         open: q.o ?? q.c,
         high: q.h ?? q.c,
         low:  q.l ?? q.c,
         close: q.c,
       };
       if (existingIdx >= 0) candles[existingIdx] = newCandle;
-      else candles.push(newCandle);
+      else                  candles.push(newCandle);
+
+      candles.sort((a, b) => a.ts - b.ts);
 
       historyByTicker[tk].candles = candles;
-      historyByTicker[tk].last_close_ts = todayMs;
+      historyByTicker[tk].last_close_ts = candleMs;
 
       await supabase.from('hawkeye_history').upsert({
         ticker: tk, candles, bootstrapped: true,
-        last_close_ts: todayMs, last_updated: new Date().toISOString(),
+        last_close_ts: candleMs, last_updated: new Date().toISOString(),
       });
       summary.updated++;
     } catch (e) {
       summary.errors.push(`${tk}: ${e.message}`);
     }
-    await sleep(150);
+    await sleep(200);
   }
 
-  // Re-evaluate conditions
   for (const card of cards) {
     const tickers = card.tickers || [];
     const conditions = card.conditions || [];
