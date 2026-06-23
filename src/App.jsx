@@ -8,7 +8,7 @@ import {
   CalendarClock, Repeat, BookOpen, Lightbulb, ListChecks,
   Eye as EyeIcon, Crosshair, ArrowUpRight, ArrowDownRight, Activity,
   ClipboardPaste, FileUp,
-  Settings, Cpu
+  Settings, Cpu, Globe
 } from "lucide-react";
 import { AreaChart, Area, XAxis, YAxis, Tooltip, ResponsiveContainer } from "recharts";
 import { getQuote, getProfile, getNews, getCandles, classifyImpact, timeAgo } from "./lib/finnhub";
@@ -20,6 +20,7 @@ import { loadCatchupCards, saveCatchupCard, deleteCatchupCard, generateCatchupBr
 import { loadHawkeyeCards, saveHawkeyeCard, deleteHawkeyeCard, describeCondition, registerTickersForBootstrap, loadBootstrapStatus, saveTickerHistory, loadTickerHistory, runHawkeyeCheckNow } from "./lib/hawkeye";
 import { loadModelPrefs, saveModelPrefs, loadAvailableProviders, labelForModel, DEFAULT_COMPLEX_MODEL, DEFAULT_SIMPLE_MODEL } from "./lib/model-prefs";
 import { parseHistoricalPaste } from "./lib/parseHistoricalPaste";
+import { parseTicker, formatTicker, normalizeTicker, isUSTicker, formatPrice, getMarket, tickerCode, tickerMarket, MARKETS, MARKET_BADGE_STYLES, TICKER_INPUT_PLACEHOLDER, TICKER_INPUT_HELP } from "./lib/markets";
 
 const DEFAULT_STATE = {
   sectorGroups: [
@@ -106,6 +107,35 @@ function getPeriodDates(periodId, customFrom, customTo) {
 }
 
 // ─── Sub-components ───────────────────────────────────────────────────────────
+function MarketBadge({ market, size = "xs" }) {
+  if (!market || market === "US") return null;
+  const style = MARKET_BADGE_STYLES[market] || { bg: "#f0f0ec", fg: "#525252" };
+  const px = size === "xs" ? "text-[9px] px-1 py-0.5" : "text-[10px] px-1.5 py-0.5";
+  return (
+    <span className={`font-bold uppercase tracking-wider rounded ${px} flex-shrink-0`}
+      style={{ background: style.bg, color: style.fg }}>
+      {market}
+    </span>
+  );
+}
+
+// Renders a ticker the way it should appear in the UI:
+//   US:      $AAPL   (optional dollar sign)
+//   Non-US:  [HK] 0700   (market badge + code)
+function TickerLabel({ symbol, showDollar = false, badgeSize = "xs", className = "" }) {
+  const market = tickerMarket(symbol);
+  const code = tickerCode(symbol);
+  if (market === "US") {
+    return <span className={className}>{showDollar ? "$" : ""}{code}</span>;
+  }
+  return (
+    <span className={`inline-flex items-center gap-1 ${className}`}>
+      <MarketBadge market={market} size={badgeSize} />
+      <span>{code}</span>
+    </span>
+  );
+}
+
 function ChartTooltip({ active, payload, label }) {
   if (!active || !payload?.length) return null;
   return (
@@ -184,7 +214,7 @@ function HawkeyeMiniChart({ ticker, candles, livePrice }) {
       <div className="flex items-center justify-between mb-2">
         <span className="text-[10px] tracking-widest uppercase opacity-40">Last {data.length} sessions</span>
         {livePrice > 0 && (
-          <span className="text-[10px] opacity-60">Live: <span className="font-semibold">${livePrice.toFixed(2)}</span></span>
+          <span className="text-[10px] opacity-60">Live: <span className="font-semibold">{formatPrice(ticker, livePrice)}</span></span>
         )}
       </div>
       <ResponsiveContainer width="100%" height={140}>
@@ -248,7 +278,7 @@ function NewsCard({ news, tags, pinned, onPin, onSelect, onTagClick }) {
       <div className="flex items-start justify-between gap-4">
         <div className="flex-1 min-w-0">
           <div className="flex items-center gap-2 mb-2 flex-wrap">
-            <button onClick={onSelect} className="text-xs font-bold px-2 py-0.5 rounded-md hover:bg-gray-200" style={{ background: "#f0f0ec" }}>${news.ticker}</button>
+            <button onClick={onSelect} className="text-xs font-bold px-2 py-0.5 rounded-md hover:bg-gray-200 inline-flex items-center" style={{ background: "#f0f0ec" }}><TickerLabel symbol={news.ticker} showDollar={true} /></button>
             <span className="text-[11px] opacity-50">{news.source}</span>
             <span className="text-[11px] opacity-30">·</span>
             <span className="text-[11px] opacity-50">{formatTimestamp(news.datetime)}</span>
@@ -429,7 +459,7 @@ function WatchingCard({ card, onToggleOpen, onDelete, onMarkRead, onMarkAllRead,
       <div className="p-5 cursor-pointer" onClick={onToggleOpen}>
         <div className="flex items-start justify-between gap-3 mb-3">
           <div className="flex items-center gap-2 flex-wrap">
-            <span className="text-xs font-bold px-2 py-0.5 rounded-md" style={{ background: "#f0f0ec" }}>${card.ticker}</span>
+            <span className="text-xs font-bold px-2 py-0.5 rounded-md inline-flex items-center" style={{ background: "#f0f0ec" }}><TickerLabel symbol={card.ticker} showDollar={true} /></span>
             <span className="text-[11px] opacity-40">+</span>
             <span className="text-xs font-medium px-2 py-0.5 rounded-md flex items-center gap-1" style={{ background: "#f0f0ec", color: "#1a1a1a" }}>
               <Eye size={10} className="opacity-50" /> {card.keyword}
@@ -1044,9 +1074,21 @@ export default function App() {
     if (next[key]) delete next[key]; else next[key] = { ticker, news, pinnedAt: Date.now(), key };
     return { ...s, pinned: next };
   });
+  // Normalize a comma-separated ticker string; returns { valid: [...], invalid: [...] }
+  const normalizeTickerList = (raw) => {
+    const parts = (raw || "").split(",").map(s => s.trim()).filter(Boolean);
+    const valid = [], invalid = [];
+    for (const p of parts) {
+      const n = normalizeTicker(p);
+      if (n) { if (!valid.includes(n)) valid.push(n); }
+      else invalid.push(p);
+    }
+    return { valid, invalid };
+  };
+
   const addTicker = () => {
-    const t = newTicker.trim().toUpperCase();
-    if (!t) return;
+    const t = normalizeTicker(newTicker);
+    if (!t) { if (newTicker.trim()) alert(TICKER_INPUT_HELP); return; }
     const targetId = newTickerGroup;
     updateState(s => {
       const upd = (groups) => groups.map(g => g.id === targetId && !g.tickers.includes(t) ? { ...g, tickers: [...g.tickers, t] } : g);
@@ -1118,9 +1160,10 @@ export default function App() {
   };
 
   const createWatchCard = () => {
-    const ticker = newCardTicker.trim().toUpperCase();
+    const ticker = normalizeTicker(newCardTicker);
     const keyword = newCardKeyword.trim();
-    if (!ticker || !keyword) return;
+    if (!ticker) { if (newCardTicker.trim()) alert(TICKER_INPUT_HELP); return; }
+    if (!keyword) return;
     if ("Notification" in window && Notification.permission === "default") Notification.requestPermission();
     const id = "wc" + Date.now();
     updateState(s => ({ ...s, watchCards: [{ id, ticker, keyword, createdAt: Date.now(), isOpen: true, matches: [] }, ...s.watchCards] }));
@@ -1148,9 +1191,9 @@ export default function App() {
 
   const createPriceAlert = async () => {
     setAlertError(null);
-    const tk = newAlertTicker.trim().toUpperCase();
+    const tk = normalizeTicker(newAlertTicker);
     const target = parseFloat(newAlertPrice);
-    if (!tk) { setAlertError("Please enter a ticker"); return; }
+    if (!tk) { setAlertError(newAlertTicker.trim() ? TICKER_INPUT_HELP : "Please enter a ticker"); return; }
     if (!target || target <= 0) { setAlertError("Please enter a valid target price"); return; }
     if (!userEmail) { setAlertError("Please set your email above first"); return; }
 
@@ -1196,7 +1239,8 @@ export default function App() {
   const createCatchupCard = async () => {
     setCuError(null);
     if (!cuName.trim()) { setCuError("Please give the card a name"); return; }
-    const tickers = cuTickers.split(",").map(s => s.trim().toUpperCase()).filter(Boolean);
+    const { valid: tickers, invalid: cuInvalid } = normalizeTickerList(cuTickers);
+    if (cuInvalid.length > 0) { setCuError(`Invalid ticker(s): ${cuInvalid.join(", ")}. ${TICKER_INPUT_HELP}`); return; }
     const topics  = cuTopics.split(",").map(s => s.trim()).filter(Boolean);
     if ((cuType === "stocks" || cuType === "stocks_and_topics") && tickers.length === 0) {
       setCuError("Please add at least one ticker"); return;
@@ -1255,7 +1299,7 @@ export default function App() {
       const g = sourceList.find(g => g.id === gid);
       return g ? g.tickers : [];
     }
-    return hkCustomTickers.split(",").map(s => s.trim().toUpperCase()).filter(Boolean);
+    return normalizeTickerList(hkCustomTickers).valid;
   }, [hkSource, hkGroupRef, hkCustomTickers, state.sectorGroups, state.customGroups]);
 
   const resetHawkeyeForm = () => {
@@ -1290,7 +1334,9 @@ export default function App() {
       groupId = g.id;
       groupName = g.name;
     } else {
-      tickers = hkCustomTickers.split(",").map(s => s.trim().toUpperCase()).filter(Boolean);
+      const { valid: hkValid, invalid: hkInvalid } = normalizeTickerList(hkCustomTickers);
+      if (hkInvalid.length > 0) { setHkError(`Invalid ticker(s): ${hkInvalid.join(", ")}. ${TICKER_INPUT_HELP}`); return; }
+      tickers = hkValid;
       if (tickers.length === 0) { setHkError("Please add at least one ticker"); return; }
     }
 
@@ -1533,8 +1579,8 @@ export default function App() {
 
   // ── Summarize: generate ─────────────────────────────────────────────────────
   const runSummary = async () => {
-    const ticker = sumTicker.trim().toUpperCase();
-    if (!ticker) { setSummaryError("Please enter a ticker"); return; }
+    const ticker = normalizeTicker(sumTicker);
+    if (!ticker) { setSummaryError(sumTicker.trim() ? TICKER_INPUT_HELP : "Please enter a ticker"); return; }
     if (sumPeriod === "custom" && (!sumCustomFrom || !sumCustomTo)) {
       setSummaryError("Please set custom from/to dates"); return;
     }
@@ -1776,7 +1822,11 @@ export default function App() {
 
           {showAddTicker && (
             <div className="mb-3 p-3 rounded-xl fade-in" style={{ background: "white", border: "1px solid #e5e5e5" }}>
-              <input autoFocus value={newTicker} onChange={e => setNewTicker(e.target.value.toUpperCase())} onKeyDown={e => e.key === "Enter" && addTicker()} placeholder="e.g. AAPL" className="w-full text-sm focus:outline-none mb-2 font-medium" />
+              <input autoFocus value={newTicker} onChange={e => setNewTicker(e.target.value.toUpperCase())} onKeyDown={e => e.key === "Enter" && addTicker()} placeholder="AAPL or HK:0700" className="w-full text-sm focus:outline-none mb-1 font-medium" />
+              <div className="flex items-start gap-1 text-[10px] opacity-50 mb-2 leading-snug">
+                <Globe size={10} className="flex-shrink-0 mt-0.5" />
+                <span>US: just the symbol (AAPL). Other markets: prefix with HK, JP, KR, SH, SZ, TW, IN, LSE, DE — e.g. <span className="font-mono">HK:0700</span>, <span className="font-mono">JP:7203</span>.</span>
+              </div>
               <div className="text-[10px] opacity-50 mb-1">Add to group:</div>
               <select value={newTickerGroup} onChange={e => setNewTickerGroup(e.target.value)} className="w-full text-xs py-1.5 px-2 rounded-md mb-2 focus:outline-none" style={{ background: "#f7f7f3", border: "1px solid #e5e5e5" }}>
                 {activeGroups.map(g => <option key={g.id} value={g.id}>{g.name}</option>)}
@@ -1799,13 +1849,13 @@ export default function App() {
                   <div className="flex items-center gap-2 min-w-0">
                     {hasHigh && <div className="w-1.5 h-1.5 rounded-full flex-shrink-0" style={{ background: "#ef4444" }} />}
                     <div className="min-w-0">
-                      <div className="font-semibold text-sm">{tk}</div>
+                      <div className="font-semibold text-sm"><TickerLabel symbol={tk} /></div>
                       <div className="text-[11px] opacity-50 truncate">{profiles[tk]?.name || (loadingTicker[tk] ? "Loading…" : "—")}</div>
                     </div>
                   </div>
                   <div className="flex items-center gap-1">
                     <div className="text-right">
-                      <div className="text-xs font-medium">{p.c ? `$${p.c.toFixed(2)}` : "—"}</div>
+                      <div className="text-xs font-medium">{p.c ? formatPrice(tk, p.c) : "—"}</div>
                       <div className="text-[11px]" style={{ color: up ? "#059669" : "#dc2626" }}>{p.c ? `${up ? "+" : ""}${(p.dp || 0).toFixed(2)}%` : ""}</div>
                     </div>
                     <button onClick={e => { e.stopPropagation(); requestDeleteTicker(tk); }} className="opacity-0 group-hover:opacity-40 hover:opacity-100 transition p-1 rounded hover:bg-red-50" style={{ color: "#dc2626" }}>
@@ -1831,12 +1881,15 @@ export default function App() {
               <section className="rounded-2xl p-8 mb-6" style={{ background: "white", boxShadow: "0 1px 3px rgba(0,0,0,0.04), 0 0 0 1px #ececec" }}>
                 <div className="flex items-start justify-between mb-6">
                   <div>
-                    <div className="text-xs tracking-widest uppercase opacity-50 mb-1">{profile.name || "—"}</div>
-                    <h2 className="font-serif-h text-5xl font-semibold tracking-tight">{selected}</h2>
-                    {profile.finnhubIndustry && <div className="text-xs opacity-50 mt-2">{profile.finnhubIndustry} · {profile.exchange}</div>}
+                    <div className="text-xs tracking-widest uppercase opacity-50 mb-1 flex items-center gap-2">
+                      {profile.name || "—"}
+                      {tickerMarket(selected) !== "US" && <MarketBadge market={tickerMarket(selected)} size="sm" />}
+                    </div>
+                    <h2 className="font-serif-h text-5xl font-semibold tracking-tight">{tickerCode(selected)}</h2>
+                    {(profile.finnhubIndustry || tickerMarket(selected) !== "US") && <div className="text-xs opacity-50 mt-2">{profile.finnhubIndustry ? `${profile.finnhubIndustry} · ` : ""}{getMarket(selected)?.name || profile.exchange}</div>}
                   </div>
                   <div className="text-right">
-                    <div className="font-serif-h text-4xl font-semibold">{quote.c ? `$${quote.c.toFixed(2)}` : "—"}</div>
+                    <div className="font-serif-h text-4xl font-semibold">{quote.c ? formatPrice(selected, quote.c) : "—"}</div>
                     {quote.c > 0 && (
                       <div className="flex items-center gap-1 justify-end text-sm mt-1" style={{ color: isUp ? "#059669" : "#dc2626" }}>
                         {isUp ? <TrendingUp size={14} /> : <TrendingDown size={14} />}
@@ -1987,7 +2040,7 @@ export default function App() {
                 <div className="grid grid-cols-12 gap-2">
                   <div className="col-span-3">
                     <label className="text-[10px] tracking-widest uppercase opacity-50 mb-1 block">Ticker</label>
-                    <input value={newCardTicker} onChange={e => setNewCardTicker(e.target.value.toUpperCase())} onKeyDown={e => e.key === "Enter" && createWatchCard()} placeholder="e.g. NVDA" className="w-full text-sm font-semibold px-3 py-2 rounded-lg border focus:outline-none focus:border-gray-900 transition" style={{ borderColor: "#e5e5e5", background: "#fafaf7" }} />
+                    <input value={newCardTicker} onChange={e => setNewCardTicker(e.target.value.toUpperCase())} onKeyDown={e => e.key === "Enter" && createWatchCard()} placeholder="NVDA or HK:0700" className="w-full text-sm font-semibold px-3 py-2 rounded-lg border focus:outline-none focus:border-gray-900 transition" style={{ borderColor: "#e5e5e5", background: "#fafaf7" }} />
                   </div>
                   <div className="col-span-7">
                     <label className="text-[10px] tracking-widest uppercase opacity-50 mb-1 block">Keyword</label>
@@ -2033,7 +2086,7 @@ export default function App() {
                   {/* Ticker */}
                   <div className="col-span-3">
                     <label className="text-[10px] tracking-widest uppercase opacity-50 mb-1 block">Ticker</label>
-                    <input value={sumTicker} onChange={e => setSumTicker(e.target.value.toUpperCase())} placeholder="e.g. AMD" className="w-full text-sm font-semibold px-3 py-2 rounded-lg border focus:outline-none focus:border-gray-900 transition" style={{ borderColor: "#e5e5e5", background: "#fafaf7" }} />
+                    <input value={sumTicker} onChange={e => setSumTicker(e.target.value.toUpperCase())} placeholder="AMD or JP:7203" className="w-full text-sm font-semibold px-3 py-2 rounded-lg border focus:outline-none focus:border-gray-900 transition" style={{ borderColor: "#e5e5e5", background: "#fafaf7" }} />
                   </div>
 
                   {/* Period */}
@@ -2172,14 +2225,14 @@ export default function App() {
                     <label className="text-[10px] tracking-widest uppercase opacity-50 mb-1 block">Ticker</label>
                     <input value={newAlertTicker} onChange={e => setNewAlertTicker(e.target.value.toUpperCase())}
                       onKeyDown={e => e.key === "Enter" && createPriceAlert()}
-                      placeholder="e.g. AMD"
+                      placeholder="AMD or HK:0700"
                       className="w-full text-sm font-semibold px-3 py-2 rounded-lg border focus:outline-none focus:border-gray-900 transition"
                       style={{ borderColor: "#e5e5e5", background: "#fafaf7" }} />
                   </div>
                   <div className="col-span-3">
                     <label className="text-[10px] tracking-widest uppercase opacity-50 mb-1 block">Target price</label>
                     <div className="relative">
-                      <span className="absolute left-3 top-1/2 -translate-y-1/2 text-sm opacity-50">$</span>
+                      <span className="absolute left-3 top-1/2 -translate-y-1/2 text-sm opacity-50">{(getMarket(normalizeTicker(newAlertTicker) || "")?.currencySymbol) || "$"}</span>
                       <input type="number" step="0.01" value={newAlertPrice} onChange={e => setNewAlertPrice(e.target.value)}
                         onKeyDown={e => e.key === "Enter" && createPriceAlert()}
                         placeholder="200.00"
@@ -2211,6 +2264,12 @@ export default function App() {
                   <p className="col-span-12 text-[11px] opacity-50 mt-1">
                     Crosses either direction — if the price climbs to your target from below, or drops to it from above, you'll get an email.
                   </p>
+                  {!isUSTicker(normalizeTicker(newAlertTicker) || "") && newAlertTicker.trim() && (
+                    <div className="col-span-12 text-[11px] px-3 py-2 rounded-lg flex items-start gap-1.5" style={{ background: "#fef3c7", color: "#92400e" }}>
+                      <Globe size={11} className="flex-shrink-0 mt-0.5" />
+                      <span>Email price alerts run during <b>US</b> market hours only, so non-US tickers aren't continuously monitored here. For {tickerMarket(normalizeTicker(newAlertTicker) || "")} stocks, use <b>Hawkeye</b> — it checks once daily after each market's close, which fits international markets better.</span>
+                    </div>
+                  )}
                 </div>
               </div>
 
@@ -2238,7 +2297,7 @@ export default function App() {
                         style={{ background: "white", border: `1px solid ${borderColor}`, boxShadow: shadowColor, opacity }}>
                         <div className="flex items-start justify-between gap-3 mb-3">
                           <div className="flex items-center gap-2 flex-wrap">
-                            <span className="text-xs font-bold px-2 py-0.5 rounded-md" style={{ background: "#f0f0ec" }}>${a.ticker}</span>
+                            <span className="text-xs font-bold px-2 py-0.5 rounded-md inline-flex items-center" style={{ background: "#f0f0ec" }}><TickerLabel symbol={a.ticker} showDollar={true} /></span>
                             <span className="text-[11px] opacity-40">target</span>
                             <span className="text-xs font-bold px-2 py-0.5 rounded-md flex items-center gap-0.5" style={{ background: "#f0f0ec" }}>
                               <DollarSign size={9} className="opacity-60" />{Number(a.target_price).toFixed(2)}
@@ -2281,11 +2340,11 @@ export default function App() {
                         <div className="grid grid-cols-3 gap-3 mb-3">
                           <div className="rounded-lg px-3 py-2" style={{ background: "#fafaf7" }}>
                             <div className="text-[10px] tracking-widest uppercase opacity-40 mb-0.5">Current</div>
-                            <div className="text-sm font-semibold">{currentPx ? `$${currentPx.toFixed(2)}` : "—"}</div>
+                            <div className="text-sm font-semibold">{currentPx ? formatPrice(a.ticker, currentPx) : "—"}</div>
                           </div>
                           <div className="rounded-lg px-3 py-2" style={{ background: "#fafaf7" }}>
                             <div className="text-[10px] tracking-widest uppercase opacity-40 mb-0.5">When set</div>
-                            <div className="text-sm font-semibold">${Number(a.start_price).toFixed(2)}</div>
+                            <div className="text-sm font-semibold">{formatPrice(a.ticker, Number(a.start_price))}</div>
                           </div>
                           <div className="rounded-lg px-3 py-2" style={{ background: "#fafaf7" }}>
                             <div className="text-[10px] tracking-widest uppercase opacity-40 mb-0.5">
@@ -2293,7 +2352,7 @@ export default function App() {
                             </div>
                             <div className="text-sm font-semibold">
                               {isTriggered
-                                ? `$${Number(a.triggered_price).toFixed(2)}`
+                                ? formatPrice(a.ticker, Number(a.triggered_price))
                                 : currentPx
                                   ? `${(((Number(a.target_price) - currentPx) / currentPx) * 100).toFixed(2)}%`
                                   : "—"}
@@ -2380,7 +2439,7 @@ export default function App() {
                       <div className="col-span-12">
                         <label className="text-[10px] tracking-widest uppercase opacity-50 mb-1 block">Tickers (comma-separated)</label>
                         <input value={cuTickers} onChange={e => setCuTickers(e.target.value.toUpperCase())}
-                          placeholder="e.g. NVDA, AMD, AVGO"
+                          placeholder="NVDA, AMD, HK:0700"
                           className="w-full text-sm font-semibold px-3 py-2 rounded-lg border focus:outline-none focus:border-gray-900 transition"
                           style={{ borderColor: "#e5e5e5", background: "#fafaf7" }} />
                       </div>
@@ -2493,7 +2552,7 @@ export default function App() {
                                   {card.type === "stocks" ? "Stocks" : card.type === "topics" ? "Topics" : "Stocks + Topics"}
                                 </span>
                                 {(card.tickers || []).slice(0, 4).map(t => (
-                                  <span key={t} className="text-xs font-bold px-2 py-0.5 rounded-md" style={{ background: "#f0f0ec" }}>${t}</span>
+                                  <span key={t} className="text-xs font-bold px-2 py-0.5 rounded-md inline-flex items-center" style={{ background: "#f0f0ec" }}><TickerLabel symbol={t} showDollar={true} /></span>
                                 ))}
                                 {(card.tickers || []).length > 4 && (
                                   <span className="text-[11px] opacity-50">+{card.tickers.length - 4} more</span>
@@ -2620,7 +2679,7 @@ export default function App() {
                                                     <p className="text-sm opacity-70 leading-relaxed mb-2">{stripTags(u.summary || "")}</p>
                                                     <div className="flex flex-wrap gap-1.5">
                                                       {(u.related || []).map(t => (
-                                                        <span key={t} className="text-[10px] font-bold px-1.5 py-0.5 rounded-md" style={{ background: "#f0f0ec" }}>${t}</span>
+                                                        <span key={t} className="text-[10px] font-bold px-1.5 py-0.5 rounded-md inline-flex items-center" style={{ background: "#f0f0ec" }}><TickerLabel symbol={t} showDollar={true} badgeSize="xs" /></span>
                                                       ))}
                                                       {(u.sources || []).map((src, j) => (
                                                         <a key={j} href={src.url} target="_blank" rel="noreferrer"
@@ -2760,7 +2819,7 @@ export default function App() {
                           </optgroup>
                         </select>
                       ) : (
-                        <input value={hkCustomTickers} onChange={e => setHkCustomTickers(e.target.value.toUpperCase())} placeholder="e.g. NVDA, AMD, AVGO, MRVL" className="w-full text-sm font-semibold px-3 py-2 rounded-lg border focus:outline-none focus:border-gray-900 transition" style={{ borderColor: "#e5e5e5", background: "#fafaf7" }} />
+                        <input value={hkCustomTickers} onChange={e => setHkCustomTickers(e.target.value.toUpperCase())} placeholder="NVDA, AMD, HK:0700, JP:7203" className="w-full text-sm font-semibold px-3 py-2 rounded-lg border focus:outline-none focus:border-gray-900 transition" style={{ borderColor: "#e5e5e5", background: "#fafaf7" }} />
                       )}
                     </div>
                   </div>
@@ -2966,7 +3025,7 @@ export default function App() {
                                   </span>
                                 )}
                                 {(card.tickers || []).slice(0, 6).map(t => (
-                                  <span key={t} className="text-xs font-bold px-2 py-0.5 rounded-md" style={{ background: "#f0f0ec" }}>${t}</span>
+                                  <span key={t} className="text-xs font-bold px-2 py-0.5 rounded-md inline-flex items-center" style={{ background: "#f0f0ec" }}><TickerLabel symbol={t} showDollar={true} /></span>
                                 ))}
                                 {(card.tickers || []).length > 6 && (
                                   <span className="text-[11px] opacity-50">+{card.tickers.length - 6} more</span>
@@ -3102,7 +3161,7 @@ export default function App() {
                                       className="w-full flex items-center justify-between gap-2 px-3 py-2 rounded-lg hover:bg-gray-50 transition"
                                       style={{ background: "white", border: "1px solid #ececec" }}>
                                       <div className="flex items-center gap-2 min-w-0 flex-wrap">
-                                        <span className="text-xs font-bold px-2 py-0.5 rounded-md flex-shrink-0" style={{ background: "#f0f0ec" }}>${t}</span>
+                                        <span className="text-xs font-bold px-2 py-0.5 rounded-md flex-shrink-0 inline-flex items-center" style={{ background: "#f0f0ec" }}><TickerLabel symbol={t} showDollar={true} /></span>
                                         {isReady ? (
                                           <>
                                             <span className="text-[11px]" style={{ color: isStale ? "#dc2626" : isFresh ? "#059669" : "#525252" }}>
@@ -3160,7 +3219,7 @@ export default function App() {
                                           <div className="flex-1 min-w-0">
                                             <div className="flex items-center gap-2 mb-2 flex-wrap">
                                               {!h.isRead && <div className="w-1.5 h-1.5 rounded-full" style={{ background: "#7c3aed" }} />}
-                                              <span className="text-xs font-bold px-2 py-0.5 rounded-md" style={{ background: "#f0f0ec" }}>${h.ticker}</span>
+                                              <span className="text-xs font-bold px-2 py-0.5 rounded-md inline-flex items-center" style={{ background: "#f0f0ec" }}><TickerLabel symbol={h.ticker} showDollar={true} /></span>
                                               <span className="text-[11px] font-bold flex items-center gap-1" style={{ color: isGain ? "#059669" : "#dc2626" }}>
                                                 {isGain ? <ArrowUpRight size={11} /> : <ArrowDownRight size={11} />}
                                                 {h.pctChange > 0 ? "+" : ""}{h.pctChange}%
@@ -3171,9 +3230,9 @@ export default function App() {
                                             </div>
                                             <div className="text-sm leading-relaxed">
                                               <span className="opacity-60">Fired at </span>
-                                              <span className="font-semibold">${Number(h.firedPrice).toFixed(2)}</span>
+                                              <span className="font-semibold">{formatPrice(h.ticker, Number(h.firedPrice))}</span>
                                               <span className="opacity-60"> · reference {cond.reference} on {h.refDate} was </span>
-                                              <span className="font-semibold">${Number(h.refPrice).toFixed(2)}</span>
+                                              <span className="font-semibold">{formatPrice(h.ticker, Number(h.refPrice))}</span>
                                               <span className="opacity-60"> · condition: {cond.thresholdPct}% {cond.direction}</span>
                                             </div>
                                           </div>
@@ -3215,3 +3274,4 @@ export default function App() {
     </div>
   );
 }
+
