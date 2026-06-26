@@ -1,6 +1,15 @@
 // compareEngine.js (v2)
 // Pure computation layer for the Compare feature. No AI, no network.
 
+// Magnitude options the user picks to tell us what abbreviated pasted numbers
+// really mean. e.g. if the data was shown "in millions", multiply by 1e6.
+export const SCALE_OPTIONS = [
+  { factor: 1,    label: 'As-is (raw)',     short: 'Raw' },
+  { factor: 1e3,  label: 'Thousands (K)',   short: 'K' },
+  { factor: 1e6,  label: 'Millions (M)',    short: 'M' },
+  { factor: 1e9,  label: 'Billions (B)',    short: 'B' },
+];
+
 export const CURRENCIES = {
   USD: { code: 'USD', symbol: '$',   name: 'US Dollar',      decimals: 2 },
   KRW: { code: 'KRW', symbol: '₩',   name: 'Korean Won',     decimals: 0 },
@@ -89,17 +98,34 @@ const MONEY_KEYS = new Set([
   'marketCap','enterpriseValue',
 ]);
 const PERSHARE_MONEY_KEYS = new Set(['epsBasic','epsDiluted','freeCashFlowPerShare','bookValuePerShare']);
+// Share-count keys are abbreviated the same way money is, so the scale multiplier
+// applies to them too (needed for correct P/S = price * shares / revenue).
+const SHARE_COUNT_KEYS = new Set(['sharesBasic','sharesDiluted']);
 
 function convFactor(stock, usd) {
   if (!usd) return 1;
   const f = stock.fxToUsd;
   return (f && !isNaN(f)) ? f : 1;
 }
+// The per-stock scale multiplier the user chose (e.g. data pasted "in millions"
+// => scaleFactor 1e6). Defaults to 1 (raw). Applied to aggregate money and share
+// counts, but NOT to per-share figures (EPS, BVPS) or ratios/percentages, which
+// are already in absolute units.
+function scaleFactor(stock) {
+  const s = stock.scaleFactor;
+  return (s && !isNaN(s) && s > 0) ? s : 1;
+}
+function isScalableMoney(key) {
+  return MONEY_KEYS.has(key) || SHARE_COUNT_KEYS.has(key);
+}
 function rawVal(stock, key, period) {
   const m = stock.parsed?.metrics?.[key];
   if (!m) return null;
   const v = m.values[period];
-  return (v === undefined) ? null : v;
+  if (v === undefined) return null;
+  // Apply the user-chosen magnitude scale to aggregate money & share counts.
+  if (isScalableMoney(key)) return v * scaleFactor(stock);
+  return v;
 }
 function val(stock, key, period, usd) {
   const v = rawVal(stock, key, period);
@@ -134,16 +160,18 @@ function ttm(stock, key, usd) {
 function ttmNative(stock, key) {
   const m = stock.parsed?.metrics?.[key];
   if (!m) return null;
+  const sf = isScalableMoney(key) ? scaleFactor(stock) : 1;
   const quarters = sortedQuarters(stock.parsed.periods.quarterly, { limit: 4, ascending: false });
   let sum = 0, count = 0;
-  for (const p of quarters) { if (m.values[p] != null) { sum += m.values[p]; count++; } }
+  for (const p of quarters) { if (m.values[p] != null) { sum += m.values[p] * sf; count++; } }
   return count === 4 ? sum : (count > 0 ? sum * (4 / count) : null);
 }
 function latestQNative(stock, key) {
   const m = stock.parsed?.metrics?.[key];
   if (!m) return { value: null };
+  const sf = isScalableMoney(key) ? scaleFactor(stock) : 1;
   for (const p of sortedQuarters(stock.parsed.periods.quarterly, { limit: 0, ascending: false })) {
-    if (m.values[p] != null) return { value: m.values[p] };
+    if (m.values[p] != null) return { value: m.values[p] * sf };
   }
   return { value: null };
 }
@@ -172,6 +200,7 @@ export const TOPICS = [
   { id: 'investing', label: 'Investing',      icon: 'Hammer',       desc: 'Capex intensity vs revenue & cash' },
   { id: 'working',   label: 'Working Capital',icon: 'RefreshCw',    desc: 'Receivables, inventory & collection' },
   { id: 'valuation', label: 'Valuation',      icon: 'Tag',          desc: 'P/E, P/S, P/B, EV multiples (live price)' },
+  { id: 'moneyflow', label: 'Money Flow',     icon: 'GitCompare',   desc: 'Income-statement flow (Sankey) per stock' },
 ];
 
 export function buildTopic(topicId, stocks, opts = {}) {
@@ -188,17 +217,42 @@ export function buildTopic(topicId, stocks, opts = {}) {
     case 'investing': return buildInvesting(stocks, o);
     case 'working':   return buildWorking(stocks, o);
     case 'valuation': return buildValuation(stocks, o);
+    case 'moneyflow': return buildMoneyFlow(stocks, o);
     default:          return { charts: [], tables: [] };
   }
 }
 
+// Apply a per-stock quarter offset: positive shifts the stock's data forward
+// (to later periods on the shared axis), negative shifts it back. Used so the
+// user can hand-align companies with different fiscal calendars.
+function shiftQuarter(period, offset) {
+  if (!offset) return period;
+  const m = /Q([1-4])\s+(\d{4})/.exec(period);
+  if (!m) return period;
+  let q = parseInt(m[1], 10);
+  let y = parseInt(m[2], 10);
+  let idx = y * 4 + (q - 1) + offset;   // zero-based quarter index
+  y = Math.floor(idx / 4);
+  q = (idx % 4) + 1;
+  return `Q${q} ${y}`;
+}
 function quarterlySeries(stocks, key, { limit = 12, usd = false } = {}) {
+  // Build the shared axis from each stock's OFFSET-shifted periods, so a shifted
+  // stock lands on the right axis slots.
   const allQ = new Set();
-  stocks.forEach(s => (s.parsed?.periods?.quarterly || []).forEach(p => allQ.add(p)));
+  stocks.forEach(s => {
+    const off = s.quarterOffset || 0;
+    (s.parsed?.periods?.quarterly || []).forEach(p => allQ.add(shiftQuarter(p, off)));
+  });
   const periods = sortedQuarters([...allQ], { limit, ascending: true });
   return periods.map(period => {
     const row = { period };
-    stocks.forEach(s => { row[s.ticker] = val(s, key, period, usd); });
+    stocks.forEach(s => {
+      const off = s.quarterOffset || 0;
+      // The stock's own period that maps to this axis slot is period - offset.
+      const ownPeriod = shiftQuarter(period, -off);
+      row[s.ticker] = val(s, key, ownPeriod, usd);
+    });
     return row;
   });
 }
@@ -487,6 +541,95 @@ function buildValuation(stocks, o) {
     ],
     tables: [table],
     liveByTicker,
+  };
+}
+
+// Money Flow: an income-statement Sankey per stock. Uses trailing-twelve-month
+// figures (USD-aware) so the picture is stable and comparable. Each stock yields
+// a node/link graph the UI renders as an SVG Sankey.
+//
+// Flow structure:
+//   Revenue ─┬─> Cost of Revenue
+//            └─> Gross Profit ─┬─> Operating Expenses ─┬─> R&D
+//                              │                       └─> SG&A
+//                              └─> Operating Income ─┬─> Tax & Other
+//                                                    └─> Net Income
+function buildMoneyFlow(stocks, o) {
+  const usd = o.usd;
+  const flows = stocks.map(s => {
+    const cur = usd ? 'USD' : s.currency;
+    const revenue  = ttm(s, 'revenue', usd);
+    const cor      = ttm(s, 'costOfRevenue', usd);
+    let   gross    = ttm(s, 'grossProfit', usd);
+    const rnd      = ttm(s, 'researchDevelopment', usd);
+    const sga      = ttm(s, 'sga', usd);
+    let   opInc    = ttm(s, 'operatingIncome', usd);
+    const netInc   = ttm(s, 'netIncome', usd);
+
+    // Derive gross profit if missing but revenue & cost known
+    let gp = gross;
+    if (gp == null && revenue != null && cor != null) gp = revenue - cor;
+
+    // Build nodes & links defensively — only include flows we have data for.
+    const nodes = [];
+    const links = [];
+    const nodeIndex = {};
+    const addNode = (name, kind) => {
+      if (nodeIndex[name] != null) return nodeIndex[name];
+      const i = nodes.length;
+      nodes.push({ name, kind });
+      nodeIndex[name] = i;
+      return i;
+    };
+    const addLink = (from, to, value, kind) => {
+      if (value == null || isNaN(value) || value <= 0) return;
+      links.push({ source: addNode(from, 'mid'), target: addNode(to, kind), value });
+    };
+
+    const positive = v => (v != null && v > 0 ? v : null);
+
+    if (revenue != null && revenue > 0) {
+      addNode('Revenue', 'root');
+      // Revenue splits into cost of revenue + gross profit
+      addLink('Revenue', 'Cost of Revenue', positive(cor), 'cost');
+      if (gp != null && gp > 0) {
+        addLink('Revenue', 'Gross Profit', gp, 'mid');
+        // Gross profit splits into OpEx and Operating Income
+        const opexParts = [];
+        if (positive(rnd)) opexParts.push(['R&D', rnd]);
+        if (positive(sga)) opexParts.push(['SG&A', sga]);
+        const opexTotal = opexParts.reduce((a, [, v]) => a + v, 0);
+        // derive operating income if missing
+        let oi = opInc;
+        if (oi == null && gp != null) oi = gp - opexTotal;
+
+        if (opexTotal > 0) {
+          addLink('Gross Profit', 'Operating Expenses', opexTotal, 'cost');
+          opexParts.forEach(([name, v]) => addLink('Operating Expenses', name, v, 'cost'));
+        }
+        if (oi != null && oi > 0) {
+          addLink('Gross Profit', 'Operating Income', oi, 'mid');
+          // Operating income splits into net income + tax/other
+          if (netInc != null && netInc > 0) {
+            addLink('Operating Income', 'Net Income', netInc, 'profit');
+            const taxOther = oi - netInc;
+            if (taxOther > 0) addLink('Operating Income', 'Tax & Other', taxOther, 'cost');
+          }
+        }
+      }
+    }
+
+    const hasData = revenue != null && revenue > 0 && links.length > 0;
+    return {
+      ticker: s.ticker, color: s.color, currency: cur,
+      revenue, hasData,
+      sankey: { nodes, links },
+    };
+  });
+
+  return {
+    charts: [{ type: 'sankey-row', title: 'Income Statement Flow (TTM)', unit: 'money', usd, flows }],
+    tables: [],
   };
 }
 
