@@ -21,6 +21,8 @@ export async function loadCompareStocks() {
   return (data || []).map(r => ({
     id: r.id, ticker: r.ticker, name: r.name,
     marketTicker: r.market_ticker, currency: r.currency,
+    scaleFactor: r.scale_factor != null ? Number(r.scale_factor) : 1,
+    quarterOffset: r.quarter_offset != null ? Number(r.quarter_offset) : 0,
     color: r.color, parsed: r.parsed, created_at: r.created_at,
   }));
 }
@@ -35,6 +37,8 @@ export async function saveCompareStock(stock) {
     name: stock.name || null,
     market_ticker: stock.marketTicker || null,
     currency: stock.currency || 'USD',
+    scale_factor: stock.scaleFactor != null ? stock.scaleFactor : 1,
+    quarter_offset: stock.quarterOffset != null ? stock.quarterOffset : 0,
     parsed: stock.parsed,
     color: stock.color || null,
     updated_at: new Date().toISOString(),
@@ -70,6 +74,20 @@ export async function updateCompareStockTicker(id, marketTicker) {
   if (!supabase) return;
   await supabase.from('compare_stocks')
     .update({ market_ticker: marketTicker, updated_at: new Date().toISOString() })
+    .eq('id', id);
+}
+
+export async function updateCompareStockScale(id, scaleFactor) {
+  if (!supabase) return;
+  await supabase.from('compare_stocks')
+    .update({ scale_factor: scaleFactor, updated_at: new Date().toISOString() })
+    .eq('id', id);
+}
+
+export async function updateCompareStockOffset(id, quarterOffset) {
+  if (!supabase) return;
+  await supabase.from('compare_stocks')
+    .update({ quarter_offset: quarterOffset, updated_at: new Date().toISOString() })
     .eq('id', id);
 }
 
