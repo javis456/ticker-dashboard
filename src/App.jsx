@@ -9,7 +9,8 @@ import {
   Eye as EyeIcon, Crosshair, ArrowUpRight, ArrowDownRight, Activity,
   ClipboardPaste, FileUp,
   Settings, Cpu, Globe,
-  Percent, BarChart3, Banknote, Scale, Users, Hammer, GitCompare, Coins
+  Percent, BarChart3, Banknote, Scale, Users, Hammer, GitCompare, Coins,
+  Library, FolderOpen, Save, Database
 } from "lucide-react";
 import { AreaChart, Area, XAxis, YAxis, Tooltip, ResponsiveContainer, BarChart, Bar, LineChart, Line, Legend, Cell, CartesianGrid } from "recharts";
 import { getQuote, getProfile, getNews, getCandles, classifyImpact, timeAgo } from "./lib/finnhub";
@@ -22,9 +23,10 @@ import { loadHawkeyeCards, saveHawkeyeCard, deleteHawkeyeCard, describeCondition
 import { loadModelPrefs, saveModelPrefs, loadAvailableProviders, labelForModel, DEFAULT_COMPLEX_MODEL, DEFAULT_SIMPLE_MODEL } from "./lib/model-prefs";
 import { parseHistoricalPaste } from "./lib/parseHistoricalPaste";
 import { parseTicker, formatTicker, normalizeTicker, isUSTicker, formatPrice, getMarket, tickerCode, tickerMarket, MARKETS, MARKET_BADGE_STYLES, TICKER_INPUT_PLACEHOLDER, TICKER_INPUT_HELP } from "./lib/markets";
-import { loadCompareStocks, saveCompareStock, deleteCompareStock, updateCompareStockCurrency, COMPARE_COLORS } from "./lib/compare";
+import { loadCompareStocks, saveCompareStock, deleteCompareStock, updateCompareStockCurrency, updateCompareStockTicker,
+  loadCompareGroups, saveCompareGroup, deleteCompareGroup, fetchPriceAndFx, COMPARE_COLORS } from "./lib/compare";
 import { parseFinancials } from "./lib/parseFinancials";
-import { TOPICS, buildTopic, formatCell, fmtMoney, fmtPercent, fmtRatio, fmtNumber, CURRENCIES, sortedQuarters } from "./lib/compareEngine";
+import { TOPICS, buildTopic, formatCell, formatCellValue, fmtMoney, fmtPercent, fmtRatio, fmtNumber, CURRENCIES, sortedQuarters } from "./lib/compareEngine";
 
 const DEFAULT_STATE = {
   sectorGroups: [
@@ -716,7 +718,7 @@ function SummaryCard({ row, onDelete }) {
 
 const TOPIC_ICONS = {
   TrendingUp, Percent, Target, LineChart: BarChart3, Banknote, Scale,
-  Users, Hammer, RefreshCw, Tag,
+  Users, Hammer, RefreshCw, Tag, Lightbulb,
 };
 
 // Tooltip for compare charts — currency/percent aware
@@ -759,15 +761,15 @@ function axisFmt(unit) {
   return v => v;
 }
 
-function CompareChart({ chart, stocks }) {
+function CompareChart({ chart, stocks, usd }) {
   const colorByTicker = {};
   const currencyByTicker = {};
-  stocks.forEach(s => { colorByTicker[s.ticker] = s.color; currencyByTicker[s.ticker] = s.currency; });
+  stocks.forEach(s => { colorByTicker[s.ticker] = s.color; currencyByTicker[s.ticker] = usd ? "USD" : s.currency; });
   const tickers = stocks.map(s => s.ticker);
   const yfmt = axisFmt(chart.unit);
 
-  // Mixed-currency money charts: note it
-  const moneyMixed = chart.unit === "money" &&
+  // When in USD mode, money values are already converted — single currency, no warning.
+  const moneyMixed = chart.unit === "money" && !usd &&
     new Set(stocks.map(s => s.currency)).size > 1;
 
   let inner = null;
@@ -813,6 +815,20 @@ function CompareChart({ chart, stocks }) {
         ))}
       </BarChart>
     );
+  } else if (chart.type === "bar-multi") {
+    // Multiple named metrics per stock (grouped). chart.keys = [{key,label,color}]
+    inner = (
+      <BarChart data={chart.rows} margin={{ top: 8, right: 12, left: 4, bottom: 4 }}>
+        <CartesianGrid strokeDasharray="2 4" stroke="#f0f0ec" vertical={false} />
+        <XAxis dataKey="ticker" tick={{ fontSize: 11, fill: "#525252" }} tickLine={false} axisLine={false} />
+        <YAxis tick={{ fontSize: 10, fill: "#a3a3a3" }} tickLine={false} axisLine={false} tickFormatter={yfmt} width={44} />
+        <Tooltip cursor={{ fill: "rgba(0,0,0,0.03)" }} />
+        <Legend wrapperStyle={{ fontSize: 11 }} iconType="circle" iconSize={8} />
+        {chart.keys.map(k => (
+          <Bar key={k.key} dataKey={k.key} name={k.label} fill={k.color} radius={[2,2,0,0]} maxBarSize={32} />
+        ))}
+      </BarChart>
+    );
   } else if (chart.type === "bar-single") {
     inner = (
       <BarChart data={chart.rows} margin={{ top: 8, right: 12, left: 4, bottom: 4 }}>
@@ -823,7 +839,7 @@ function CompareChart({ chart, stocks }) {
           content={({ active, payload, label }) => {
             if (!active || !payload?.length) return null;
             const v = payload[0].value;
-            const val = v == null ? "—" : chart.unit === "percent" ? fmtPercent(v) : chart.unit === "ratiox" ? fmtRatio(v,1,"x") : v;
+            const val = v == null ? "—" : chart.unit === "percent" ? fmtPercent(v) : chart.unit === "ratiox" ? fmtRatio(v,1,"x") : chart.unit === "money" ? fmtMoney(v, usd ? "USD" : "USD") : v;
             return <div className="rounded-lg px-3 py-2 text-xs shadow-lg" style={{ background:"white", border:"1px solid #e5e5e5" }}><span className="font-semibold">{label}</span>: {val}</div>;
           }} />
         <Bar dataKey="value" radius={[3,3,0,0]} maxBarSize={56}>
@@ -836,29 +852,33 @@ function CompareChart({ chart, stocks }) {
   return (
     <div className="rounded-2xl p-5" style={{ background: "white", border: "1px solid #ececec" }}>
       <div className="flex items-baseline justify-between mb-3 gap-2">
-        <h4 className="font-semibold text-sm">{chart.title}</h4>
+        <h4 className="font-semibold text-sm">{chart.title}{usd && chart.unit === "money" ? " · USD" : ""}</h4>
         {chart.note && <span className="text-[10px] opacity-50 text-right max-w-[50%]">{chart.note}</span>}
       </div>
       <ResponsiveContainer width="100%" height={260}>{inner}</ResponsiveContainer>
       {moneyMixed && (
         <p className="text-[10px] opacity-50 mt-2 flex items-center gap-1">
-          <AlertCircle size={9} /> Stocks use different currencies — compare shapes/trends, not absolute heights.
+          <AlertCircle size={9} /> Stocks use different currencies — turn on USD to compare absolute values, or read shapes/trends only.
         </p>
       )}
     </div>
   );
 }
 
-function CompareTable({ table, stocks }) {
-  // Determine winner per row (best value) when higherBetter is defined
-  function bestTicker(col) {
-    if (col.higherBetter === undefined) return null;
+function CompareTable({ table, stocks, usd }) {
+  const slots = table.slots || ["Latest"];
+  const multi = slots.length > 1;
+  const dispCur = s => (usd ? "USD" : s.currency);
+
+  // Best value per metric (compared on the "Latest" slot only)
+  function bestTicker(metric) {
+    if (metric.higherBetter === undefined) return null;
     let best = null, bestVal = null;
-    for (const r of table.rows) {
-      const cell = r.cells[col.key];
-      if (!cell || cell.v == null || isNaN(cell.v)) continue;
-      if (bestVal == null || (col.higherBetter ? cell.v > bestVal : cell.v < bestVal)) {
-        bestVal = cell.v; best = r.ticker;
+    for (const s of stocks) {
+      const v = table.data?.[s.ticker]?.[metric.label]?.["Latest"];
+      if (v == null || isNaN(v)) continue;
+      if (bestVal == null || (metric.higherBetter ? v > bestVal : v < bestVal)) {
+        bestVal = v; best = s.ticker;
       }
     }
     return best;
@@ -873,34 +893,58 @@ function CompareTable({ table, stocks }) {
         <table className="w-full text-sm">
           <thead>
             <tr style={{ background: "#fafaf7" }}>
-              <th className="text-left px-5 py-2.5 font-medium text-xs opacity-50 tracking-wide">Metric</th>
+              <th className="text-left px-5 py-2.5 font-medium text-xs opacity-50 tracking-wide sticky left-0" style={{ background: "#fafaf7" }}>Metric</th>
               {stocks.map(s => (
-                <th key={s.id} className="text-right px-4 py-2.5 font-semibold text-xs whitespace-nowrap">
+                <th key={s.id} colSpan={multi ? slots.length : 1} className="text-right px-4 py-2 font-semibold text-xs whitespace-nowrap border-l" style={{ borderColor: "#f0f0ec" }}>
                   <span className="inline-flex items-center gap-1.5">
                     <span className="w-2 h-2 rounded-full" style={{ background: s.color }} />
                     {s.ticker}
                   </span>
+                  {usd && <span className="ml-1 text-[9px] opacity-40 font-normal">USD</span>}
                 </th>
               ))}
             </tr>
+            {multi && (
+              <tr style={{ background: "#fafaf7" }}>
+                <th className="sticky left-0" style={{ background: "#fafaf7" }}></th>
+                {stocks.map(s => (
+                  slots.map((slot, si) => {
+                    // show the actual period label for this stock+slot when available
+                    const pl = table.periodLabels?.[s.ticker];
+                    const isAnnual = table.metrics?.some(m => m.scale === "a");
+                    const arr = pl ? (isAnnual ? pl.a : pl.q) : null;
+                    const lbl = arr && arr[si] ? arr[si] : slot;
+                    return (
+                      <th key={s.id+slot} className="text-right px-4 pb-2 text-[9px] font-medium opacity-40 whitespace-nowrap border-l" style={{ borderColor: si === 0 ? "#f0f0ec" : "transparent" }}>{lbl}</th>
+                    );
+                  })
+                ))}
+              </tr>
+            )}
           </thead>
           <tbody>
-            {table.columns.map((col, ri) => {
-              const winner = bestTicker(col);
+            {table.metrics.map((metric, ri) => {
+              const winner = bestTicker(metric);
               return (
-                <tr key={col.key} style={{ borderTop: ri === 0 ? "none" : "1px solid #f5f5f2" }}>
-                  <td className="px-5 py-2.5 text-xs opacity-70">{col.label}</td>
-                  {stocks.map(s => {
-                    const row = table.rows.find(r => r.ticker === s.ticker);
-                    const cell = row?.cells[col.key];
-                    const isWin = winner && s.ticker === winner;
-                    return (
-                      <td key={s.id} className="px-4 py-2.5 text-right tabular-nums whitespace-nowrap"
-                        style={{ fontWeight: isWin ? 700 : 400, color: isWin ? "#15803d" : "#1a1a1a" }}>
-                        {formatCell(cell, s.currency)}
-                      </td>
-                    );
-                  })}
+                <tr key={metric.label} style={{ borderTop: ri === 0 ? "none" : "1px solid #f5f5f2" }}>
+                  <td className="px-5 py-2.5 text-xs opacity-70 sticky left-0 whitespace-nowrap" style={{ background: "white" }}>{metric.label}</td>
+                  {stocks.map(s => (
+                    slots.map((slot, si) => {
+                      const v = table.data?.[s.ticker]?.[metric.label]?.[slot];
+                      const isWin = !multi || slot === "Latest" ? (winner && s.ticker === winner) : false;
+                      const isLatest = slot === "Latest";
+                      return (
+                        <td key={s.id+slot} className="px-4 py-2.5 text-right tabular-nums whitespace-nowrap border-l"
+                          style={{
+                            borderColor: si === 0 ? "#f5f5f2" : "transparent",
+                            fontWeight: isWin ? 700 : 400,
+                            color: isWin ? "#15803d" : (isLatest ? "#1a1a1a" : "#a3a3a3"),
+                          }}>
+                          {formatCellValue(v, metric.fmt, dispCur(s))}
+                        </td>
+                      );
+                    })
+                  ))}
                 </tr>
               );
             })}
@@ -915,6 +959,7 @@ function AddStockModal({ onClose, onAdd, existingCount }) {
   const [step, setStep] = useState("paste");   // paste → confirm
   const [ticker, setTicker] = useState("");
   const [name, setName] = useState("");
+  const [marketTicker, setMarketTicker] = useState("");
   const [currency, setCurrency] = useState("USD");
   const [pasteText, setPasteText] = useState("");
   const [parsed, setParsed] = useState(null);
@@ -934,7 +979,12 @@ function AddStockModal({ onClose, onAdd, existingCount }) {
   };
 
   const doAdd = () => {
-    onAdd({ ticker: ticker.trim().toUpperCase(), name: name.trim(), currency, parsed });
+    onAdd({
+      ticker: ticker.trim().toUpperCase(),
+      name: name.trim(),
+      marketTicker: marketTicker.trim() || ticker.trim().toUpperCase(),
+      currency, parsed,
+    });
   };
 
   const metricCount = parsed ? Object.keys(parsed.metrics).length : 0;
@@ -951,24 +1001,31 @@ function AddStockModal({ onClose, onAdd, existingCount }) {
 
         {step === "paste" && (
           <>
-            <p className="text-sm opacity-60 mb-4">Paste the financial statements, then tell us the ticker and currency. No AI — the data is parsed instantly and stays on your account.</p>
+            <p className="text-sm opacity-60 mb-4">Paste the financial statements, then tell us the ticker and currency. No AI — the data is parsed instantly and saved to your library for reuse.</p>
             <div className="grid grid-cols-2 gap-3 mb-3">
               <div>
                 <label className="text-xs font-semibold block mb-1">Ticker symbol *</label>
-                <input value={ticker} onChange={e => setTicker(e.target.value)} placeholder="e.g. MU, KRX000660" className="w-full text-sm px-3 py-2 rounded-lg focus:outline-none" style={{ background: "#fafaf7", border: "1px solid #e5e5e5" }} />
+                <input value={ticker} onChange={e => setTicker(e.target.value)} placeholder="e.g. MU, SK Hynix" className="w-full text-sm px-3 py-2 rounded-lg focus:outline-none" style={{ background: "#fafaf7", border: "1px solid #e5e5e5" }} />
               </div>
               <div>
                 <label className="text-xs font-semibold block mb-1">Company name (optional)</label>
                 <input value={name} onChange={e => setName(e.target.value)} placeholder="e.g. Micron" className="w-full text-sm px-3 py-2 rounded-lg focus:outline-none" style={{ background: "#fafaf7", border: "1px solid #e5e5e5" }} />
               </div>
             </div>
-            <div className="mb-3">
-              <label className="text-xs font-semibold block mb-1">Currency of this data *</label>
-              <select value={currency} onChange={e => setCurrency(e.target.value)} className="w-full text-sm px-3 py-2 rounded-lg focus:outline-none" style={{ background: "#fafaf7", border: "1px solid #e5e5e5" }}>
-                {Object.values(CURRENCIES).map(c => (
-                  <option key={c.code} value={c.code}>{c.symbol} {c.name} ({c.code})</option>
-                ))}
-              </select>
+            <div className="grid grid-cols-2 gap-3 mb-3">
+              <div>
+                <label className="text-xs font-semibold block mb-1">Market ticker (for live price)</label>
+                <input value={marketTicker} onChange={e => setMarketTicker(e.target.value)} placeholder="e.g. MU or KR:000660" className="w-full text-sm px-3 py-2 rounded-lg focus:outline-none" style={{ background: "#fafaf7", border: "1px solid #e5e5e5" }} />
+                <p className="text-[10px] opacity-40 mt-1">US: just the symbol (MU). Non-US: market-prefixed (KR:000660, JP:8035). Leave blank to use the ticker above.</p>
+              </div>
+              <div>
+                <label className="text-xs font-semibold block mb-1">Currency of this data *</label>
+                <select value={currency} onChange={e => setCurrency(e.target.value)} className="w-full text-sm px-3 py-2 rounded-lg focus:outline-none" style={{ background: "#fafaf7", border: "1px solid #e5e5e5" }}>
+                  {Object.values(CURRENCIES).map(c => (
+                    <option key={c.code} value={c.code}>{c.symbol} {c.name} ({c.code})</option>
+                  ))}
+                </select>
+              </div>
             </div>
             <div className="mb-3">
               <label className="text-xs font-semibold block mb-1">Financial data</label>
@@ -992,7 +1049,7 @@ function AddStockModal({ onClose, onAdd, existingCount }) {
               <div className="text-xs space-y-1" style={{ color: "#166534" }}>
                 <div>Recognized <b>{metricCount}</b> financial metrics</div>
                 <div><b>{qCount}</b> quarters · <b>{yCount}</b> annual periods</div>
-                <div>Ticker: <b>{ticker.toUpperCase()}</b> · Currency: <b>{currency}</b></div>
+                <div>Ticker: <b>{ticker.toUpperCase()}</b> · Price ticker: <b>{marketTicker.trim() || ticker.toUpperCase()}</b> · Currency: <b>{currency}</b></div>
               </div>
             </div>
             {parsed.warnings.length > 0 && (
@@ -1004,6 +1061,76 @@ function AddStockModal({ onClose, onAdd, existingCount }) {
               <button onClick={doAdd} className="flex-1 py-2 rounded-md text-white text-sm font-medium" style={{ background: "#1a1a1a" }}>Add to comparison</button>
               <button onClick={() => setStep("paste")} className="px-4 py-2 rounded-md text-sm" style={{ background: "#f0f0ec" }}>Back</button>
             </div>
+          </>
+        )}
+      </div>
+    </div>
+  );
+}
+
+function StockLibraryModal({ stocks, activeGroup, onClose, onAddToGroup, onRemoveFromGroup, onDeleteStock, onPasteNew }) {
+  const inGroup = id => activeGroup && (activeGroup.stockIds || []).includes(id);
+  const groupFull = activeGroup && (activeGroup.stockIds || []).length >= 5;
+
+  return (
+    <div onClick={onClose} className="fixed inset-0 z-50 flex items-center justify-center p-4" style={{ background: "rgba(0,0,0,0.4)" }}>
+      <div onClick={e => e.stopPropagation()} className="w-full max-w-2xl rounded-2xl p-6 fade-in max-h-[90vh] overflow-y-auto" style={{ background: "white" }}>
+        <div className="flex items-center justify-between mb-1">
+          <h3 className="font-serif-h text-xl font-semibold">Your stock library</h3>
+          <button onClick={onClose} className="p-1 opacity-50 hover:opacity-100"><X size={16} /></button>
+        </div>
+        <p className="text-sm opacity-60 mb-4">
+          Financial data you've already pasted. Add any of them to {activeGroup ? <>the group <b>{activeGroup.name}</b></> : "a group"} without re-entering data.
+        </p>
+
+        {stocks.length === 0 ? (
+          <div className="rounded-xl p-8 text-center" style={{ background: "#fafaf7", border: "1px dashed #d4d4d4" }}>
+            <Database size={28} className="mx-auto mb-2 opacity-30" />
+            <p className="text-sm opacity-60 mb-3">No saved stocks yet.</p>
+            <button onClick={onPasteNew} className="text-sm px-4 py-2 rounded-lg text-white font-medium" style={{ background: "#1a1a1a" }}>
+              <Plus size={14} className="inline mr-1" /> Paste a new stock
+            </button>
+          </div>
+        ) : (
+          <>
+            <div className="space-y-2 mb-4">
+              {stocks.map(s => {
+                const here = inGroup(s.id);
+                const metricCount = s.parsed ? Object.keys(s.parsed.metrics || {}).length : 0;
+                const qCount = s.parsed?.periods?.quarterly?.length || 0;
+                return (
+                  <div key={s.id} className="flex items-center gap-3 p-3 rounded-xl" style={{ background: "#fafaf7", border: "1px solid #ececec" }}>
+                    <span className="w-2.5 h-2.5 rounded-full flex-shrink-0" style={{ background: s.color }} />
+                    <div className="min-w-0 flex-1">
+                      <div className="flex items-center gap-2">
+                        <span className="text-sm font-semibold">{s.ticker}</span>
+                        {s.name && <span className="text-xs opacity-50 truncate">{s.name}</span>}
+                        <span className="text-[10px] px-1.5 py-0.5 rounded-full" style={{ background: "#e0f2fe", color: "#0369a1" }}>{s.currency}</span>
+                      </div>
+                      <div className="text-[11px] opacity-40">{metricCount} metrics · {qCount} quarters{s.marketTicker && s.marketTicker !== s.ticker ? ` · price: ${s.marketTicker}` : ""}</div>
+                    </div>
+                    {activeGroup && (
+                      here ? (
+                        <button onClick={() => onRemoveFromGroup(s.id)} className="text-xs px-3 py-1.5 rounded-lg font-medium flex items-center gap-1" style={{ background: "#dcfce7", color: "#166534" }}>
+                          <Check size={12} /> In group
+                        </button>
+                      ) : (
+                        <button onClick={() => onAddToGroup(s.id)} disabled={groupFull} className="text-xs px-3 py-1.5 rounded-lg font-medium flex items-center gap-1 disabled:opacity-40" style={{ background: "#1a1a1a", color: "white" }}>
+                          <Plus size={12} /> Add
+                        </button>
+                      )
+                    )}
+                    <button onClick={() => onDeleteStock(s.id)} title="Delete from library permanently" className="p-1.5 opacity-40 hover:opacity-100" style={{ color: "#dc2626" }}>
+                      <Trash2 size={13} />
+                    </button>
+                  </div>
+                );
+              })}
+            </div>
+            {groupFull && <p className="text-[11px] mb-3 px-3 py-2 rounded-lg" style={{ background: "#fef3c7", color: "#92400e" }}>This group is full (5 stocks). Remove one to add another.</p>}
+            <button onClick={onPasteNew} className="w-full text-sm px-4 py-2 rounded-lg font-medium" style={{ background: "#f0f0ec" }}>
+              <Plus size={14} className="inline mr-1" /> Paste a new stock instead
+            </button>
           </>
         )}
       </div>
@@ -1081,10 +1208,20 @@ export default function App() {
   const [hawkeyeCards, setHawkeyeCards] = useState([]);
 
   // Compare feature state
-  const [compareStocks, setCompareStocks] = useState([]);
+  const [compareStocks, setCompareStocks] = useState([]);      // the library (all saved stocks)
+  const [compareGroups, setCompareGroups] = useState([]);      // saved named groups
+  const [activeGroupId, setActiveGroupId] = useState("");
   const [compareTopic, setCompareTopic] = useState("revenue");
+  const [comparePeriods, setComparePeriods] = useState(1);     // 1..3 periods shown
+  const [compareUsd, setCompareUsd] = useState(false);         // USD conversion toggle
   const [showAddCompareStock, setShowAddCompareStock] = useState(false);
-  const [compareDeleteId, setCompareDeleteId] = useState(null);
+  const [showStockLibrary, setShowStockLibrary] = useState(false);
+  const [compareDeleteStockId, setCompareDeleteStockId] = useState(null);
+  const [compareDeleteGroupId, setCompareDeleteGroupId] = useState(null);
+  const [showNewGroup, setShowNewGroup] = useState(false);
+  const [newCompareGroupName, setNewCompareGroupName] = useState("");
+  const [priceData, setPriceData] = useState({});              // { stockId: {price, fxToUsd, ...} }
+  const [loadingPrices, setLoadingPrices] = useState(false);
   const [showNewHawkeye, setShowNewHawkeye] = useState(false);
   const [openHawkeyeCards, setOpenHawkeyeCards] = useState({});
   // Form state
@@ -1194,6 +1331,9 @@ export default function App() {
         setModelPrefs(prefs);
         const cmp = await loadCompareStocks();
         setCompareStocks(cmp);
+        const grps = await loadCompareGroups();
+        setCompareGroups(grps);
+        if (grps.length > 0) setActiveGroupId(grps[0].id);
         setCloudStatus("synced");
       } catch { setCloudStatus("offline"); }
       setHydrated(true);
@@ -1751,23 +1891,51 @@ export default function App() {
     setConfirmDelete({ type: "hawkeye", id: cardId, label: `"${name}"` });
 
   // ── Compare handlers ──────────────────────────────────────────────────────
-  const addCompareStock = async ({ ticker, name, currency, parsed }) => {
-    if (compareStocks.length >= 5) return;
+  // ── Compare: derived active group + its stocks ────────────────────────────
+  const activeGroup = useMemo(
+    () => compareGroups.find(g => g.id === activeGroupId) || null,
+    [compareGroups, activeGroupId]
+  );
+
+  const activeStocks = useMemo(() => {
+    if (!activeGroup) return [];
+    return (activeGroup.stockIds || [])
+      .map(id => compareStocks.find(s => s.id === id))
+      .filter(Boolean)
+      .map(s => {
+        const pd = priceData[s.id];
+        return {
+          ...s,
+          fxToUsd: pd?.fxToUsd != null ? pd.fxToUsd : (s.currency === "USD" ? 1 : null),
+          livePrice: pd?.price != null ? pd.price : null,
+        };
+      });
+  }, [activeGroup, compareStocks, priceData]);
+
+  // ── Compare: stock library handlers ───────────────────────────────────────
+  const addCompareStock = async ({ ticker, name, marketTicker, currency, parsed }) => {
     const usedColors = new Set(compareStocks.map(s => s.color));
     const color = COMPARE_COLORS.find(c => !usedColors.has(c)) || COMPARE_COLORS[compareStocks.length % COMPARE_COLORS.length];
     const stock = {
       id: "cmp_" + Date.now() + "_" + Math.random().toString(36).slice(2, 7),
-      ticker, name, currency, parsed, color,
+      ticker, name, marketTicker, currency, parsed, color,
     };
     setCompareStocks(prev => [...prev, stock]);
     setShowAddCompareStock(false);
     await saveCompareStock(stock);
+    // Auto-add to the active group (create one if none exists)
+    if (activeGroup) {
+      if ((activeGroup.stockIds || []).length < 5) await addStockToGroup(stock.id);
+    } else {
+      await createCompareGroup("My comparison", [stock.id]);
+    }
   };
 
-  const removeCompareStock = async (id) => {
+  const removeCompareStockFromLibrary = async (id) => {
     setCompareStocks(prev => prev.filter(s => s.id !== id));
-    setCompareDeleteId(null);
-    await deleteCompareStock(id);
+    setCompareGroups(prev => prev.map(g => ({ ...g, stockIds: (g.stockIds || []).filter(x => x !== id) })));
+    setCompareDeleteStockId(null);
+    await deleteCompareStock(id);   // also strips from groups server-side
   };
 
   const changeCompareCurrency = async (id, currency) => {
@@ -1775,10 +1943,90 @@ export default function App() {
     await updateCompareStockCurrency(id, currency);
   };
 
+  // ── Compare: group handlers ───────────────────────────────────────────────
+  const createCompareGroup = async (name, stockIds = []) => {
+    const group = {
+      id: "grp_" + Date.now() + "_" + Math.random().toString(36).slice(2, 7),
+      name: name || "Untitled group",
+      stockIds,
+    };
+    setCompareGroups(prev => [...prev, group]);
+    setActiveGroupId(group.id);
+    setShowNewGroup(false);
+    setNewCompareGroupName("");
+    await saveCompareGroup(group);
+    return group;
+  };
+
+  const removeCompareGroup = async (id) => {
+    setCompareGroups(prev => {
+      const next = prev.filter(g => g.id !== id);
+      if (activeGroupId === id) setActiveGroupId(next[0]?.id || "");
+      return next;
+    });
+    setCompareDeleteGroupId(null);
+    await deleteCompareGroup(id);   // keeps stocks in library
+  };
+
+  const addStockToGroup = async (stockId) => {
+    if (!activeGroup) { await createCompareGroup("My comparison", [stockId]); return; }
+    if ((activeGroup.stockIds || []).includes(stockId)) return;
+    if ((activeGroup.stockIds || []).length >= 5) return;
+    const updated = { ...activeGroup, stockIds: [...(activeGroup.stockIds || []), stockId] };
+    setCompareGroups(prev => prev.map(g => g.id === updated.id ? updated : g));
+    await saveCompareGroup(updated);
+  };
+
+  const removeStockFromGroup = async (stockId) => {
+    if (!activeGroup) return;
+    const updated = { ...activeGroup, stockIds: (activeGroup.stockIds || []).filter(x => x !== stockId) };
+    setCompareGroups(prev => prev.map(g => g.id === updated.id ? updated : g));
+    await saveCompareGroup(updated);
+  };
+
+  // ── Compare: live price + FX refresh ──────────────────────────────────────
+  const refreshComparePrices = async (stocksToFetch) => {
+    const list = stocksToFetch || activeStocks;
+    if (!list || list.length === 0) return;
+    setLoadingPrices(true);
+    try {
+      const results = await Promise.all(list.map(async s => {
+        const res = await fetchPriceAndFx(s.marketTicker || s.ticker, s.currency);
+        return { id: s.id, res };
+      }));
+      setPriceData(prev => {
+        const next = { ...prev };
+        results.forEach(({ id, res }) => { next[id] = res; });
+        return next;
+      });
+    } finally {
+      setLoadingPrices(false);
+    }
+  };
+
+  // Auto-fetch prices when the active group changes (once per group view)
+  useEffect(() => {
+    if (!hydrated) return;
+    if (!activeGroup) return;
+    const ids = activeGroup.stockIds || [];
+    const missing = ids.filter(id => !priceData[id]);
+    if (missing.length === 0) return;
+    const toFetch = ids
+      .map(id => compareStocks.find(s => s.id === id))
+      .filter(Boolean);
+    if (toFetch.length > 0) refreshComparePrices(toFetch);
+    // eslint-disable-next-line
+  }, [activeGroupId, hydrated]);
+
   const compareBuilt = useMemo(() => {
-    if (compareStocks.length === 0) return { charts: [], tables: [] };
-    return buildTopic(compareTopic, compareStocks);
-  }, [compareTopic, compareStocks]);
+    if (activeStocks.length === 0) return { charts: [], tables: [] };
+    return buildTopic(compareTopic, activeStocks, { periods: comparePeriods, usd: compareUsd });
+  }, [compareTopic, activeStocks, comparePeriods, compareUsd]);
+
+  const fxMissing = useMemo(
+    () => compareUsd && activeStocks.some(s => s.currency !== "USD" && s.fxToUsd == null),
+    [compareUsd, activeStocks]
+  );
 
   // ── History paste handlers ────────────────────────────────────────────────
   const previewPasteForTicker = (ticker, text) => {
@@ -2046,7 +2294,7 @@ export default function App() {
                 { id: "alerts",    label: "Alerts",    badge: triggeredAlerts.length, badgeColor: "#dc2626" },
                 { id: "catchup",   label: "Catchup",   badge: overdueCount, badgeColor: "#dc2626" },
                 { id: "hawkeye",   label: "Hawkeye",   badge: hawkeyeUnreadCount, badgeColor: "#7c3aed" },
-                { id: "compare",   label: "Compare",   badge: compareStocks.length, badgeColor: "#0369a1" },
+                { id: "compare",   label: "Compare",   badge: compareGroups.length, badgeColor: "#0369a1" },
               ].map(tab => (
                 <button key={tab.id} onClick={() => setView(tab.id)} className="px-3 py-1.5 text-sm rounded-full transition-all flex items-center gap-1.5"
                   style={{ background: view === tab.id ? "#1a1a1a" : "transparent", color: view === tab.id ? "#fafaf7" : "#1a1a1a" }}>
@@ -2116,12 +2364,30 @@ export default function App() {
           existingCount={compareStocks.length}
         />
       )}
-      {compareDeleteId && (
+      {showStockLibrary && (
+        <StockLibraryModal
+          stocks={compareStocks}
+          activeGroup={activeGroup}
+          onClose={() => setShowStockLibrary(false)}
+          onAddToGroup={addStockToGroup}
+          onRemoveFromGroup={removeStockFromGroup}
+          onDeleteStock={(id) => setCompareDeleteStockId(id)}
+          onPasteNew={() => { setShowStockLibrary(false); setShowAddCompareStock(true); }}
+        />
+      )}
+      {compareDeleteStockId && (
         <ConfirmModal
-          title="Remove this stock?"
-          message="This stock and its pasted financial data will be removed from your comparison. You can paste it again later."
-          onConfirm={() => removeCompareStock(compareDeleteId)}
-          onCancel={() => setCompareDeleteId(null)} />
+          title="Delete from library?"
+          message="This stock and its pasted financial data will be permanently removed from your library and every group. This cannot be undone."
+          onConfirm={() => removeCompareStockFromLibrary(compareDeleteStockId)}
+          onCancel={() => setCompareDeleteStockId(null)} />
+      )}
+      {compareDeleteGroupId && (
+        <ConfirmModal
+          title="Delete this group?"
+          message="The group is removed, but the stocks' financial data stays in your library and can be reused in other groups."
+          onConfirm={() => removeCompareGroup(compareDeleteGroupId)}
+          onCancel={() => setCompareDeleteGroupId(null)} />
       )}
       {confirmDelete && (
         <ConfirmModal
@@ -3621,32 +3887,74 @@ export default function App() {
 
           {view === "compare" && (
             <section>
-              <div className="mb-6 flex items-start justify-between gap-4 flex-wrap">
+              <div className="mb-5 flex items-start justify-between gap-4 flex-wrap">
                 <div>
                   <h2 className="font-serif-h text-3xl font-semibold mb-1">Compare</h2>
-                  <p className="text-sm opacity-60 max-w-2xl">Compare up to 5 stocks side by side on financials you paste in yourself. Pick a topic below — tables and charts are computed instantly, no AI.</p>
+                  <p className="text-sm opacity-60 max-w-2xl">Build saved groups of up to 5 stocks and compare them on financials you paste in. Data is kept in your library to reuse. No AI — everything is computed instantly.</p>
                 </div>
-                <button onClick={() => setShowAddCompareStock(true)} disabled={compareStocks.length >= 5}
-                  className="flex items-center gap-1.5 text-sm px-4 py-2 rounded-lg text-white font-medium disabled:opacity-40"
-                  style={{ background: "#1a1a1a" }}>
-                  <Plus size={14} /> Add stock {compareStocks.length > 0 ? `(${compareStocks.length}/5)` : ""}
-                </button>
+                <div className="flex items-center gap-2">
+                  <button onClick={() => setShowStockLibrary(true)}
+                    className="flex items-center gap-1.5 text-sm px-3 py-2 rounded-lg font-medium"
+                    style={{ background: "white", border: "1px solid #ececec" }}>
+                    <Library size={14} /> Library {compareStocks.length > 0 ? `(${compareStocks.length})` : ""}
+                  </button>
+                  <button onClick={() => setShowAddCompareStock(true)}
+                    className="flex items-center gap-1.5 text-sm px-4 py-2 rounded-lg text-white font-medium"
+                    style={{ background: "#1a1a1a" }}>
+                    <Plus size={14} /> Add stock
+                  </button>
+                </div>
               </div>
 
-              {compareStocks.length === 0 ? (
+              {/* Group tabs */}
+              <div className="flex items-center gap-2 mb-6 flex-wrap">
+                {compareGroups.map(g => {
+                  const active = g.id === activeGroupId;
+                  return (
+                    <div key={g.id} className="flex items-center rounded-lg overflow-hidden" style={{ border: active ? "1px solid #0369a1" : "1px solid #ececec" }}>
+                      <button onClick={() => setActiveGroupId(g.id)}
+                        className="text-sm px-3 py-1.5 flex items-center gap-1.5"
+                        style={{ background: active ? "#0369a1" : "white", color: active ? "white" : "#1a1a1a" }}>
+                        <FolderOpen size={13} /> {g.name}
+                        <span className="text-[10px] opacity-70">{(g.stockIds || []).length}</span>
+                      </button>
+                      {active && (
+                        <button onClick={() => setCompareDeleteGroupId(g.id)} title="Delete group"
+                          className="px-1.5 py-1.5" style={{ background: "#0369a1", color: "white" }}>
+                          <X size={12} />
+                        </button>
+                      )}
+                    </div>
+                  );
+                })}
+                {showNewGroup ? (
+                  <div className="flex items-center gap-1 rounded-lg px-2 py-1" style={{ border: "1px solid #0369a1" }}>
+                    <input autoFocus value={newCompareGroupName} onChange={e => setNewCompareGroupName(e.target.value)}
+                      onKeyDown={e => { if (e.key === "Enter" && newCompareGroupName.trim()) createCompareGroup(newCompareGroupName.trim()); if (e.key === "Escape") { setShowNewGroup(false); setNewCompareGroupName(""); } }}
+                      placeholder="Group name" className="text-sm px-1 focus:outline-none w-32" />
+                    <button onClick={() => newCompareGroupName.trim() && createCompareGroup(newCompareGroupName.trim())} className="p-1" style={{ color: "#0369a1" }}><Check size={14} /></button>
+                  </div>
+                ) : (
+                  <button onClick={() => setShowNewGroup(true)} className="text-sm px-3 py-1.5 rounded-lg flex items-center gap-1.5 opacity-70 hover:opacity-100" style={{ border: "1px dashed #d4d4d4" }}>
+                    <FolderPlus size={13} /> New group
+                  </button>
+                )}
+              </div>
+
+              {compareGroups.length === 0 ? (
                 <div className="rounded-2xl p-12 text-center" style={{ background: "white", border: "1px dashed #d4d4d4" }}>
                   <GitCompare size={32} className="mx-auto mb-3 opacity-30" />
-                  <p className="text-sm opacity-60 mb-1">No stocks added yet.</p>
-                  <p className="text-xs opacity-40 mb-4">Add 2 or more stocks to start comparing their financials.</p>
+                  <p className="text-sm opacity-60 mb-1">No comparison groups yet.</p>
+                  <p className="text-xs opacity-40 mb-4">Create a group, then add stocks to start comparing.</p>
                   <button onClick={() => setShowAddCompareStock(true)} className="text-sm px-4 py-2 rounded-lg text-white font-medium" style={{ background: "#1a1a1a" }}>
                     <Plus size={14} className="inline mr-1" /> Add your first stock
                   </button>
                 </div>
-              ) : (
+              ) : !activeGroup ? null : (
                 <>
-                  {/* Stock chips with currency selector + remove */}
-                  <div className="flex flex-wrap gap-2 mb-5">
-                    {compareStocks.map(s => (
+                  {/* Stock chips for active group */}
+                  <div className="flex flex-wrap gap-2 mb-5 items-center">
+                    {activeStocks.map(s => (
                       <div key={s.id} className="flex items-center gap-2 pl-3 pr-2 py-1.5 rounded-lg" style={{ background: "white", border: "1px solid #ececec" }}>
                         <span className="w-2.5 h-2.5 rounded-full" style={{ background: s.color }} />
                         <span className="text-sm font-semibold">{s.ticker}</span>
@@ -3656,13 +3964,23 @@ export default function App() {
                           title="Currency of this stock's data">
                           {Object.values(CURRENCIES).map(c => <option key={c.code} value={c.code}>{c.code}</option>)}
                         </select>
-                        <button onClick={() => setCompareDeleteId(s.id)} className="p-0.5 opacity-40 hover:opacity-100"><X size={13} /></button>
+                        {s.livePrice != null && (
+                          <span className="text-[10px] px-1.5 py-0.5 rounded-full" style={{ background: "#dcfce7", color: "#166534" }} title="Yesterday's close used for live valuation">
+                            {fmtNumber(s.livePrice, { compact: false, decimals: 2 })}
+                          </span>
+                        )}
+                        <button onClick={() => removeStockFromGroup(s.id)} title="Remove from this group (keeps data in library)" className="p-0.5 opacity-40 hover:opacity-100"><X size={13} /></button>
                       </div>
                     ))}
+                    {activeStocks.length < 5 && (
+                      <button onClick={() => setShowStockLibrary(true)} className="text-xs px-3 py-2 rounded-lg flex items-center gap-1 opacity-60 hover:opacity-100" style={{ border: "1px dashed #d4d4d4" }}>
+                        <Plus size={12} /> Add from library
+                      </button>
+                    )}
                   </div>
 
                   {/* Topic tags */}
-                  <div className="flex flex-wrap gap-2 mb-6">
+                  <div className="flex flex-wrap gap-2 mb-5">
                     {TOPICS.map(t => {
                       const Icon = TOPIC_ICONS[t.icon] || BarChart3;
                       const active = compareTopic === t.id;
@@ -3676,28 +3994,54 @@ export default function App() {
                     })}
                   </div>
 
-                  {compareStocks.length < 2 && (
+                  {/* Controls: period selector + USD toggle + refresh prices */}
+                  <div className="flex items-center gap-3 mb-6 flex-wrap">
+                    <div className="flex items-center gap-1 rounded-lg p-1" style={{ background: "#f0f0ec" }}>
+                      <span className="text-[11px] opacity-50 px-2">Periods</span>
+                      {[1, 2, 3].map(n => (
+                        <button key={n} onClick={() => setComparePeriods(n)}
+                          className="text-xs w-7 h-7 rounded-md font-medium transition-all"
+                          style={{ background: comparePeriods === n ? "white" : "transparent", boxShadow: comparePeriods === n ? "0 1px 2px rgba(0,0,0,0.06)" : "none" }}>
+                          {n}
+                        </button>
+                      ))}
+                    </div>
+
+                    <button onClick={() => setCompareUsd(v => !v)}
+                      className="flex items-center gap-1.5 text-sm px-3 py-2 rounded-lg font-medium transition-all"
+                      style={{ background: compareUsd ? "#15803d" : "white", color: compareUsd ? "white" : "#1a1a1a", border: compareUsd ? "1px solid #15803d" : "1px solid #ececec" }}>
+                      <Coins size={14} /> {compareUsd ? "USD" : "Original currency"}
+                    </button>
+
+                    <button onClick={() => refreshComparePrices()} disabled={loadingPrices}
+                      className="flex items-center gap-1.5 text-sm px-3 py-2 rounded-lg opacity-70 hover:opacity-100 disabled:opacity-40"
+                      style={{ background: "white", border: "1px solid #ececec" }}>
+                      <RefreshCw size={13} className={loadingPrices ? "animate-spin" : ""} /> {loadingPrices ? "Fetching…" : "Refresh prices & FX"}
+                    </button>
+                  </div>
+
+                  {activeStocks.length < 2 && (
                     <div className="text-xs px-4 py-2.5 rounded-lg mb-5 inline-flex items-center gap-2" style={{ background: "#fef3c7", color: "#92400e" }}>
-                      <AlertCircle size={12} /> Add at least one more stock to see a real comparison.
+                      <AlertCircle size={12} /> Add at least one more stock to this group to see a real comparison.
                     </div>
                   )}
-
-                  {/* Topic description */}
-                  <div className="mb-4">
-                    <p className="text-sm opacity-60">{TOPICS.find(t => t.id === compareTopic)?.desc}</p>
-                  </div>
+                  {fxMissing && (
+                    <div className="text-xs px-4 py-2.5 rounded-lg mb-5 inline-flex items-center gap-2" style={{ background: "#fef3c7", color: "#92400e" }}>
+                      <AlertCircle size={12} /> Some FX rates couldn't be fetched — those values stay in original currency. Try "Refresh prices & FX".
+                    </div>
+                  )}
 
                   {/* Tables */}
                   <div className="space-y-5 mb-6">
                     {compareBuilt.tables.map((tbl, i) => (
-                      <CompareTable key={i} table={tbl} stocks={compareStocks} />
+                      <CompareTable key={i} table={tbl} stocks={activeStocks} usd={compareUsd} />
                     ))}
                   </div>
 
                   {/* Charts */}
                   <div className="grid grid-cols-1 lg:grid-cols-2 gap-5">
                     {compareBuilt.charts.map((chart, i) => (
-                      <CompareChart key={i} chart={chart} stocks={compareStocks} />
+                      <CompareChart key={i} chart={chart} stocks={activeStocks} usd={compareUsd} />
                     ))}
                   </div>
                 </>
