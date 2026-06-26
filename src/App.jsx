@@ -24,9 +24,10 @@ import { loadModelPrefs, saveModelPrefs, loadAvailableProviders, labelForModel, 
 import { parseHistoricalPaste } from "./lib/parseHistoricalPaste";
 import { parseTicker, formatTicker, normalizeTicker, isUSTicker, formatPrice, getMarket, tickerCode, tickerMarket, MARKETS, MARKET_BADGE_STYLES, TICKER_INPUT_PLACEHOLDER, TICKER_INPUT_HELP } from "./lib/markets";
 import { loadCompareStocks, saveCompareStock, deleteCompareStock, updateCompareStockCurrency, updateCompareStockTicker,
+  updateCompareStockScale, updateCompareStockOffset,
   loadCompareGroups, saveCompareGroup, deleteCompareGroup, fetchPriceAndFx, COMPARE_COLORS } from "./lib/compare";
 import { parseFinancials } from "./lib/parseFinancials";
-import { TOPICS, buildTopic, formatCell, formatCellValue, fmtMoney, fmtPercent, fmtRatio, fmtNumber, CURRENCIES, sortedQuarters } from "./lib/compareEngine";
+import { TOPICS, buildTopic, formatCell, formatCellValue, fmtMoney, fmtPercent, fmtRatio, fmtNumber, CURRENCIES, SCALE_OPTIONS, sortedQuarters } from "./lib/compareEngine";
 
 const DEFAULT_STATE = {
   sectorGroups: [
@@ -761,6 +762,121 @@ function axisFmt(unit) {
   return v => v;
 }
 
+// SVG Sankey for one stock's income-statement flow. Lightweight, no library.
+// Lays nodes out in columns by depth; link thickness ∝ value.
+function MoneyFlowSankey({ flow, usd }) {
+  const W = 320, H = 300, PAD = 8;
+  const cur = usd ? "USD" : flow.currency;
+
+  if (!flow.hasData) {
+    return (
+      <div className="rounded-2xl p-5 flex flex-col" style={{ background: "white", border: "1px solid #ececec" }}>
+        <div className="flex items-center gap-2 mb-3">
+          <span className="w-2.5 h-2.5 rounded-full" style={{ background: flow.color }} />
+          <h4 className="font-semibold text-sm">{flow.ticker}</h4>
+        </div>
+        <div className="flex-1 flex items-center justify-center text-xs opacity-40 py-12">
+          Not enough income-statement data to chart the flow.
+        </div>
+      </div>
+    );
+  }
+
+  const { nodes, links } = flow.sankey;
+
+  // Assign each node a column (depth) via longest path from a root.
+  const depth = nodes.map(() => 0);
+  const outLinks = nodes.map(() => []);
+  const inLinks = nodes.map(() => []);
+  links.forEach(l => { outLinks[l.source].push(l); inLinks[l.target].push(l); });
+  // iterate to stabilize depths
+  for (let iter = 0; iter < nodes.length; iter++) {
+    links.forEach(l => { if (depth[l.target] < depth[l.source] + 1) depth[l.target] = depth[l.source] + 1; });
+  }
+  const maxDepth = Math.max(...depth, 0);
+
+  // Node total value = max(sum in, sum out)
+  const nodeValue = nodes.map((_, i) => {
+    const inSum = inLinks[i].reduce((a, l) => a + l.value, 0);
+    const outSum = outLinks[i].reduce((a, l) => a + l.value, 0);
+    return Math.max(inSum, outSum);
+  });
+
+  // Group nodes by column, lay out vertically proportional to value
+  const cols = {};
+  nodes.forEach((n, i) => { (cols[depth[i]] = cols[depth[i]] || []).push(i); });
+  const colX = d => PAD + (maxDepth === 0 ? 0 : (d / maxDepth) * (W - 2 * PAD - 80));
+  const NODE_W = 12;
+
+  const totalForScale = Math.max(...Object.values(cols).map(idxs => idxs.reduce((a, i) => a + nodeValue[i], 0)), 1);
+  const scaleY = (H - 2 * PAD) / totalForScale;
+
+  const nodePos = {};
+  Object.entries(cols).forEach(([d, idxs]) => {
+    idxs.sort((a, b) => nodeValue[b] - nodeValue[a]);
+    let y = PAD;
+    idxs.forEach(i => {
+      const h = Math.max(nodeValue[i] * scaleY, 2);
+      nodePos[i] = { x: colX(+d), y, h };
+      y += h + 10;
+    });
+  });
+
+  const kindColor = {
+    root: flow.color, mid: flow.color, profit: "#15803d", cost: "#d4d4d4",
+  };
+
+  // Build link ribbons; track running offsets at each node side
+  const outOff = nodes.map(() => 0);
+  const inOff = nodes.map(() => 0);
+  const ribbons = links.map((l, li) => {
+    const s = nodePos[l.source], t = nodePos[l.target];
+    if (!s || !t) return null;
+    const lh = Math.max(l.value * scaleY, 1);
+    const sy = s.y + outOff[l.source]; outOff[l.source] += lh;
+    const ty = t.y + inOff[l.target]; inOff[l.target] += lh;
+    const x1 = s.x + NODE_W, x2 = t.x;
+    const xm = (x1 + x2) / 2;
+    const tnode = nodes[l.target];
+    const col = kindColor[tnode.kind] || flow.color;
+    const d = `M${x1},${sy} C${xm},${sy} ${xm},${ty} ${x2},${ty} L${x2},${ty+lh} C${xm},${ty+lh} ${xm},${sy+lh} ${x1},${sy+lh} Z`;
+    return <path key={li} d={d} fill={col} opacity={0.28} />;
+  });
+
+  return (
+    <div className="rounded-2xl p-5" style={{ background: "white", border: "1px solid #ececec" }}>
+      <div className="flex items-center justify-between mb-1">
+        <div className="flex items-center gap-2">
+          <span className="w-2.5 h-2.5 rounded-full" style={{ background: flow.color }} />
+          <h4 className="font-semibold text-sm">{flow.ticker}</h4>
+        </div>
+        <span className="text-[10px] opacity-50">Revenue {fmtMoney(flow.revenue, cur)}</span>
+      </div>
+      <svg viewBox={`0 0 ${W} ${H}`} width="100%" height={H} style={{ overflow: "visible" }}>
+        {ribbons}
+        {nodes.map((n, i) => {
+          const p = nodePos[i]; if (!p) return null;
+          const labelLeft = depth[i] >= maxDepth;
+          return (
+            <g key={i}>
+              <rect x={p.x} y={p.y} width={NODE_W} height={p.h} rx={2} fill={kindColor[n.kind] || flow.color} />
+              <text
+                x={labelLeft ? p.x - 5 : p.x + NODE_W + 5}
+                y={p.y + p.h / 2}
+                textAnchor={labelLeft ? "end" : "start"}
+                dominantBaseline="middle"
+                style={{ fontSize: 9, fill: "#525252" }}>
+                {n.name}
+                <tspan style={{ fill: "#a3a3a3" }}> {fmtMoney(nodeValue[i], cur)}</tspan>
+              </text>
+            </g>
+          );
+        })}
+      </svg>
+    </div>
+  );
+}
+
 function CompareChart({ chart, stocks, usd }) {
   const colorByTicker = {};
   const currencyByTicker = {};
@@ -961,6 +1077,7 @@ function AddStockModal({ onClose, onAdd, existingCount }) {
   const [name, setName] = useState("");
   const [marketTicker, setMarketTicker] = useState("");
   const [currency, setCurrency] = useState("USD");
+  const [scaleFactor, setScaleFactor] = useState(1);
   const [pasteText, setPasteText] = useState("");
   const [parsed, setParsed] = useState(null);
   const [error, setError] = useState("");
@@ -983,7 +1100,7 @@ function AddStockModal({ onClose, onAdd, existingCount }) {
       ticker: ticker.trim().toUpperCase(),
       name: name.trim(),
       marketTicker: marketTicker.trim() || ticker.trim().toUpperCase(),
-      currency, parsed,
+      currency, scaleFactor, parsed,
     });
   };
 
@@ -1028,6 +1145,15 @@ function AddStockModal({ onClose, onAdd, existingCount }) {
               </div>
             </div>
             <div className="mb-3">
+              <label className="text-xs font-semibold block mb-1">What were the numbers originally in?</label>
+              <select value={scaleFactor} onChange={e => setScaleFactor(Number(e.target.value))} className="w-full text-sm px-3 py-2 rounded-lg focus:outline-none" style={{ background: "#fafaf7", border: "1px solid #e5e5e5" }}>
+                {SCALE_OPTIONS.map(o => (
+                  <option key={o.factor} value={o.factor}>{o.label}</option>
+                ))}
+              </select>
+              <p className="text-[10px] opacity-40 mt-1">Your pasted numbers are usually abbreviated. If revenue of $41,456 really means $41.456 billion, choose Millions. This rescales every money value so comparisons and USD conversion are correct.</p>
+            </div>
+            <div className="mb-3">
               <label className="text-xs font-semibold block mb-1">Financial data</label>
               <p className="text-[11px] opacity-50 mb-2">Copy the Income Statement, Balance Sheet, Cash Flow, and Key Ratios tables from your data source and paste them all here (one after another is fine).</p>
               <textarea value={pasteText} onChange={e => setPasteText(e.target.value)} rows={8}
@@ -1050,6 +1176,7 @@ function AddStockModal({ onClose, onAdd, existingCount }) {
                 <div>Recognized <b>{metricCount}</b> financial metrics</div>
                 <div><b>{qCount}</b> quarters · <b>{yCount}</b> annual periods</div>
                 <div>Ticker: <b>{ticker.toUpperCase()}</b> · Price ticker: <b>{marketTicker.trim() || ticker.toUpperCase()}</b> · Currency: <b>{currency}</b></div>
+                <div>Scale: <b>{(SCALE_OPTIONS.find(o => o.factor === scaleFactor) || {}).label || "As-is"}</b></div>
               </div>
             </div>
             {parsed.warnings.length > 0 && (
@@ -1913,12 +2040,15 @@ export default function App() {
   }, [activeGroup, compareStocks, priceData]);
 
   // ── Compare: stock library handlers ───────────────────────────────────────
-  const addCompareStock = async ({ ticker, name, marketTicker, currency, parsed }) => {
+  const addCompareStock = async ({ ticker, name, marketTicker, currency, scaleFactor, parsed }) => {
     const usedColors = new Set(compareStocks.map(s => s.color));
     const color = COMPARE_COLORS.find(c => !usedColors.has(c)) || COMPARE_COLORS[compareStocks.length % COMPARE_COLORS.length];
     const stock = {
       id: "cmp_" + Date.now() + "_" + Math.random().toString(36).slice(2, 7),
-      ticker, name, marketTicker, currency, parsed, color,
+      ticker, name, marketTicker, currency,
+      scaleFactor: scaleFactor || 1,
+      quarterOffset: 0,
+      parsed, color,
     };
     setCompareStocks(prev => [...prev, stock]);
     setShowAddCompareStock(false);
@@ -1941,6 +2071,16 @@ export default function App() {
   const changeCompareCurrency = async (id, currency) => {
     setCompareStocks(prev => prev.map(s => s.id === id ? { ...s, currency } : s));
     await updateCompareStockCurrency(id, currency);
+  };
+
+  const changeCompareScale = async (id, scaleFactor) => {
+    setCompareStocks(prev => prev.map(s => s.id === id ? { ...s, scaleFactor } : s));
+    await updateCompareStockScale(id, scaleFactor);
+  };
+
+  const changeCompareOffset = async (id, quarterOffset) => {
+    setCompareStocks(prev => prev.map(s => s.id === id ? { ...s, quarterOffset } : s));
+    await updateCompareStockOffset(id, quarterOffset);
   };
 
   // ── Compare: group handlers ───────────────────────────────────────────────
@@ -3964,6 +4104,18 @@ export default function App() {
                           title="Currency of this stock's data">
                           {Object.values(CURRENCIES).map(c => <option key={c.code} value={c.code}>{c.code}</option>)}
                         </select>
+                        <select value={s.scaleFactor || 1} onChange={e => changeCompareScale(s.id, Number(e.target.value))}
+                          className="text-[11px] rounded px-1 py-0.5 focus:outline-none cursor-pointer" style={{ background: "#fafaf7", border: "1px solid #ececec" }}
+                          title="Original magnitude of this stock's numbers">
+                          {SCALE_OPTIONS.map(o => <option key={o.factor} value={o.factor}>{o.short}</option>)}
+                        </select>
+                        <span className="inline-flex items-center rounded overflow-hidden" style={{ border: "1px solid #ececec" }} title="Shift this stock's quarters on the charts to align fiscal calendars">
+                          <button onClick={() => changeCompareOffset(s.id, (s.quarterOffset || 0) - 1)} className="px-1 text-[11px] hover:bg-gray-100" style={{ color: "#525252" }}>−</button>
+                          <span className="text-[10px] px-1 tabular-nums" style={{ minWidth: 26, textAlign: "center" }}>
+                            {(s.quarterOffset || 0) === 0 ? "Q±0" : `Q${s.quarterOffset > 0 ? "+" : ""}${s.quarterOffset}`}
+                          </span>
+                          <button onClick={() => changeCompareOffset(s.id, (s.quarterOffset || 0) + 1)} className="px-1 text-[11px] hover:bg-gray-100" style={{ color: "#525252" }}>+</button>
+                        </span>
                         {s.livePrice != null && (
                           <span className="text-[10px] px-1.5 py-0.5 rounded-full" style={{ background: "#dcfce7", color: "#166534" }} title="Yesterday's close used for live valuation">
                             {fmtNumber(s.livePrice, { compact: false, decimals: 2 })}
@@ -4039,11 +4191,29 @@ export default function App() {
                   </div>
 
                   {/* Charts */}
-                  <div className="grid grid-cols-1 lg:grid-cols-2 gap-5">
-                    {compareBuilt.charts.map((chart, i) => (
-                      <CompareChart key={i} chart={chart} stocks={activeStocks} usd={compareUsd} />
-                    ))}
-                  </div>
+                  {compareBuilt.charts.some(c => c.type === "sankey-row") ? (
+                    <div className="space-y-5">
+                      {compareBuilt.charts.filter(c => c.type === "sankey-row").map((chart, ci) => (
+                        <div key={ci}>
+                          <div className="flex items-baseline justify-between mb-3 gap-2">
+                            <h4 className="font-semibold text-sm">{chart.title}{compareUsd ? " · USD" : ""}</h4>
+                            <span className="text-[10px] opacity-50">Width of each ribbon is proportional to the money flowing through it</span>
+                          </div>
+                          <div className="grid grid-cols-1 md:grid-cols-2 xl:grid-cols-3 gap-4">
+                            {chart.flows.map((flow, fi) => (
+                              <MoneyFlowSankey key={fi} flow={flow} usd={compareUsd} />
+                            ))}
+                          </div>
+                        </div>
+                      ))}
+                    </div>
+                  ) : (
+                    <div className="grid grid-cols-1 lg:grid-cols-2 gap-5">
+                      {compareBuilt.charts.map((chart, i) => (
+                        <CompareChart key={i} chart={chart} stocks={activeStocks} usd={compareUsd} />
+                      ))}
+                    </div>
+                  )}
                 </>
               )}
             </section>
