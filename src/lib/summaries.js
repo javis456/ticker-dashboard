@@ -37,14 +37,26 @@ export async function deleteSummary(id) {
 
 // Call the serverless function to generate a summary
 export async function generateSummary(params) {
+  const headers = { 'Content-Type': 'application/json' };
+  try {
+    const { supabase } = await import('./supabase');
+    const { data } = await supabase.auth.getSession();
+    if (data?.session?.access_token) headers['Authorization'] = `Bearer ${data.session.access_token}`;
+  } catch {}
   const res = await fetch('/api/summarize', {
     method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
+    headers,
     body: JSON.stringify(params),
   });
   if (!res.ok) {
-    const err = await res.text();
-    throw new Error(`Summary failed: ${res.status} ${err}`);
+    let body = null;
+    try { body = await res.json(); } catch {}
+    if (res.status === 429 && body?.upgrade) {
+      const e = new Error(body.error || 'Free tier limit reached');
+      e.upgrade = true;
+      throw e;
+    }
+    throw new Error(`Summary failed: ${res.status} ${body?.error || ''}`);
   }
   return res.json();
 }
