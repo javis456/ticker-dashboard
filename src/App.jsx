@@ -10,11 +10,15 @@ import {
   ClipboardPaste, FileUp,
   Settings, Cpu, Globe,
   Percent, BarChart3, Banknote, Scale, Users, Hammer, GitCompare, Coins,
-  Library, FolderOpen, Save, Database
+  Library, FolderOpen, Save, Database,
+  LogOut, LogIn, User, Lock, Crown, ShieldCheck
 } from "lucide-react";
 import { AreaChart, Area, XAxis, YAxis, Tooltip, ResponsiveContainer, BarChart, Bar, LineChart, Line, Legend, Cell, CartesianGrid } from "recharts";
 import { getQuote, getProfile, getNews, getCandles, classifyImpact, timeAgo } from "./lib/finnhub";
-import { supabase, getIdentity, setIdentity, loadState, saveState } from "./lib/supabase";
+import { supabase, getIdentity, setIdentity, loadState, saveState,
+  signUpWithEmail, signInWithEmail, signInWithGoogle, signOut, getSession, onAuthChange,
+  loadProfile, updateUsername, getUsage, monthKey, claimAnonymousData, getAnonIdentity } from "./lib/supabase";
+import { TIER_LIMITS, effectiveLimits, isPro, FREE_LIMIT_LABELS } from "./lib/tiers";
 import { tagNews, AVAILABLE_TAGS, TAG_STYLES } from "./lib/tagger";
 import { loadSummaries, saveSummary, deleteSummary, generateSummary } from "./lib/summaries";
 import { loadUserEmail, saveUserEmail, loadAlerts, createAlert, stopAlert, deleteAlert } from "./lib/alerts";
@@ -1265,9 +1269,261 @@ function StockLibraryModal({ stocks, activeGroup, onClose, onAddToGroup, onRemov
   );
 }
 
+// ── Landing / Auth components ───────────────────────────────────────────────
+
+function LandingPage({ onLogin, onRegister }) {
+  return (
+    <div className="fixed inset-0 overflow-hidden" style={{ background: "#0e0c0b" }}>
+      {/* Full-screen background video */}
+      <video
+        autoPlay muted loop playsInline
+        poster="/ticker-hero-poster.jpg"
+        className="absolute inset-0 w-full h-full object-cover"
+        style={{ opacity: 0.55 }}>
+        <source src="/ticker-hero.mp4" type="video/mp4" />
+      </video>
+      {/* Dark gradient overlay for legibility */}
+      <div className="absolute inset-0" style={{ background: "linear-gradient(180deg, rgba(14,12,11,0.45) 0%, rgba(14,12,11,0.7) 100%)" }} />
+
+      {/* Top bar */}
+      <div className="relative z-10 flex items-center justify-between px-8 py-6">
+        <div className="flex items-center gap-1">
+          <span className="font-serif-h text-2xl font-bold" style={{ color: "#faf7f2" }}>Ticker</span>
+          <span className="font-serif-h text-2xl font-bold" style={{ color: "#c2410c" }}>.</span>
+        </div>
+        <div className="flex items-center gap-2">
+          <button onClick={onLogin} className="text-sm px-4 py-2 rounded-lg font-medium transition" style={{ color: "#faf7f2", border: "1px solid rgba(255,255,255,0.25)" }}>
+            Log in
+          </button>
+          <button onClick={onRegister} className="text-sm px-4 py-2 rounded-lg font-medium transition" style={{ background: "#c2410c", color: "white" }}>
+            Get started
+          </button>
+        </div>
+      </div>
+
+      {/* Hero copy */}
+      <div className="relative z-10 flex flex-col items-center justify-center text-center px-6" style={{ height: "calc(100vh - 88px)", marginTop: "-40px" }}>
+        <h1 className="font-serif-h font-bold mb-5 leading-tight" style={{ color: "#faf7f2", fontSize: "clamp(2.5rem, 6vw, 5rem)", maxWidth: 900 }}>
+          Your personal<br />market intelligence
+        </h1>
+        <p className="text-lg mb-8 max-w-xl" style={{ color: "rgba(250,247,242,0.8)" }}>
+          Track, summarize, and compare the stocks you care about — across US, China, Korea, Japan and more. One calm dashboard, no noise.
+        </p>
+        <div className="flex items-center gap-3">
+          <button onClick={onRegister} className="text-base px-7 py-3 rounded-xl font-semibold transition" style={{ background: "#c2410c", color: "white" }}>
+            Create your account
+          </button>
+          <button onClick={onLogin} className="text-base px-7 py-3 rounded-xl font-semibold transition" style={{ color: "#faf7f2", border: "1px solid rgba(255,255,255,0.3)" }}>
+            Log in
+          </button>
+        </div>
+        <p className="text-xs mt-6" style={{ color: "rgba(250,247,242,0.5)" }}>
+          Free tier available · Pro unlocks unlimited AI features
+        </p>
+      </div>
+    </div>
+  );
+}
+
+function AuthModal({ mode, onClose, onSwitchMode, onAuthed }) {
+  const [email, setEmail] = useState("");
+  const [password, setPassword] = useState("");
+  const [username, setUsername] = useState("");
+  const [busy, setBusy] = useState(false);
+  const [error, setError] = useState("");
+  const [info, setInfo] = useState("");
+  const isRegister = mode === "register";
+
+  const submit = async () => {
+    setError(""); setInfo("");
+    if (!email.trim() || !password) { setError("Email and password are required."); return; }
+    if (isRegister && !username.trim()) { setError("Choose a username."); return; }
+    if (isRegister && password.length < 6) { setError("Password must be at least 6 characters."); return; }
+    setBusy(true);
+    try {
+      if (isRegister) {
+        const { error } = await signUpWithEmail({ email: email.trim(), password, username: username.trim() });
+        if (error) { setError(error.message); setBusy(false); return; }
+        setInfo("Account created. If email confirmation is on, check your inbox — then log in.");
+        // Many projects auto-confirm; try immediate sign-in.
+        const { error: e2 } = await signInWithEmail({ email: email.trim(), password });
+        if (!e2) { onAuthed?.(); return; }
+      } else {
+        const { error } = await signInWithEmail({ email: email.trim(), password });
+        if (error) { setError(error.message); setBusy(false); return; }
+        onAuthed?.();
+        return;
+      }
+    } catch (e) {
+      setError(String(e.message || e));
+    }
+    setBusy(false);
+  };
+
+  const google = async () => {
+    setBusy(true); setError("");
+    const { error } = await signInWithGoogle();
+    if (error) { setError(error.message); setBusy(false); }
+    // On success the browser redirects to Google.
+  };
+
+  return (
+    <div onClick={onClose} className="fixed inset-0 z-50 flex items-center justify-center p-4" style={{ background: "rgba(0,0,0,0.6)" }}>
+      <div onClick={e => e.stopPropagation()} className="w-full max-w-md rounded-2xl p-7 fade-in" style={{ background: "white" }}>
+        <div className="flex items-center justify-between mb-1">
+          <div className="flex items-center gap-1">
+            <span className="font-serif-h text-xl font-bold">Ticker</span>
+            <span className="font-serif-h text-xl font-bold" style={{ color: "#c2410c" }}>.</span>
+          </div>
+          <button onClick={onClose} className="p-1 opacity-50 hover:opacity-100"><X size={16} /></button>
+        </div>
+        <h3 className="font-serif-h text-2xl font-semibold mb-1">{isRegister ? "Create your account" : "Welcome back"}</h3>
+        <p className="text-sm opacity-60 mb-5">{isRegister ? "Free to start. Upgrade anytime." : "Log in to your dashboard."}</p>
+
+        <button onClick={google} disabled={busy}
+          className="w-full flex items-center justify-center gap-2 py-2.5 rounded-lg text-sm font-medium mb-4 disabled:opacity-50"
+          style={{ background: "white", border: "1px solid #e5e5e5" }}>
+          <svg width="16" height="16" viewBox="0 0 48 48"><path fill="#EA4335" d="M24 9.5c3.54 0 6.71 1.22 9.21 3.6l6.85-6.85C35.9 2.38 30.47 0 24 0 14.62 0 6.51 5.38 2.56 13.22l7.98 6.19C12.43 13.72 17.74 9.5 24 9.5z"/><path fill="#4285F4" d="M46.98 24.55c0-1.57-.15-3.09-.38-4.55H24v9.02h12.94c-.58 2.96-2.26 5.48-4.78 7.18l7.73 6c4.51-4.18 7.09-10.36 7.09-17.65z"/><path fill="#FBBC05" d="M10.53 28.59c-.48-1.45-.76-2.99-.76-4.59s.27-3.14.76-4.59l-7.98-6.19C.92 16.46 0 20.12 0 24c0 3.88.92 7.54 2.56 10.78l7.97-6.19z"/><path fill="#34A853" d="M24 48c6.48 0 11.93-2.13 15.89-5.81l-7.73-6c-2.15 1.45-4.92 2.3-8.16 2.3-6.26 0-11.57-4.22-13.47-9.91l-7.98 6.19C6.51 42.62 14.62 48 24 48z"/></svg>
+          Continue with Google
+        </button>
+
+        <div className="flex items-center gap-3 mb-4">
+          <div className="flex-1 h-px" style={{ background: "#ececec" }} />
+          <span className="text-xs opacity-40">or</span>
+          <div className="flex-1 h-px" style={{ background: "#ececec" }} />
+        </div>
+
+        {isRegister && (
+          <div className="mb-3">
+            <label className="text-xs font-semibold block mb-1">Username</label>
+            <input value={username} onChange={e => setUsername(e.target.value)} placeholder="e.g. greenbull"
+              className="w-full text-sm px-3 py-2 rounded-lg focus:outline-none" style={{ background: "#fafaf7", border: "1px solid #e5e5e5" }} />
+          </div>
+        )}
+        <div className="mb-3">
+          <label className="text-xs font-semibold block mb-1">Email</label>
+          <input type="email" value={email} onChange={e => setEmail(e.target.value)} placeholder="you@example.com"
+            className="w-full text-sm px-3 py-2 rounded-lg focus:outline-none" style={{ background: "#fafaf7", border: "1px solid #e5e5e5" }} />
+        </div>
+        <div className="mb-4">
+          <label className="text-xs font-semibold block mb-1">Password</label>
+          <input type="password" value={password} onChange={e => setPassword(e.target.value)}
+            onKeyDown={e => { if (e.key === "Enter") submit(); }}
+            placeholder={isRegister ? "At least 6 characters" : "Your password"}
+            className="w-full text-sm px-3 py-2 rounded-lg focus:outline-none" style={{ background: "#fafaf7", border: "1px solid #e5e5e5" }} />
+        </div>
+
+        {error && <div className="text-xs px-3 py-2 rounded-lg mb-3" style={{ background: "#fee2e2", color: "#991b1b" }}>{error}</div>}
+        {info && <div className="text-xs px-3 py-2 rounded-lg mb-3" style={{ background: "#dcfce7", color: "#166534" }}>{info}</div>}
+
+        <button onClick={submit} disabled={busy}
+          className="w-full py-2.5 rounded-lg text-white text-sm font-semibold mb-3 disabled:opacity-50" style={{ background: "#1a1a1a" }}>
+          {busy ? "Please wait…" : (isRegister ? "Create account" : "Log in")}
+        </button>
+
+        <p className="text-xs text-center opacity-60">
+          {isRegister ? "Already have an account?" : "New here?"}{" "}
+          <button onClick={() => onSwitchMode(isRegister ? "login" : "register")} className="font-semibold" style={{ color: "#c2410c" }}>
+            {isRegister ? "Log in" : "Create one"}
+          </button>
+        </p>
+      </div>
+    </div>
+  );
+}
+
+function UpgradeModal({ reason, onClose }) {
+  return (
+    <div onClick={onClose} className="fixed inset-0 z-50 flex items-center justify-center p-4" style={{ background: "rgba(0,0,0,0.5)" }}>
+      <div onClick={e => e.stopPropagation()} className="w-full max-w-md rounded-2xl p-7 fade-in" style={{ background: "white" }}>
+        <div className="flex items-center justify-between mb-3">
+          <div className="flex items-center gap-2">
+            <Crown size={20} style={{ color: "#c2410c" }} />
+            <h3 className="font-serif-h text-xl font-semibold">Upgrade to Pro</h3>
+          </div>
+          <button onClick={onClose} className="p-1 opacity-50 hover:opacity-100"><X size={16} /></button>
+        </div>
+        {reason && <p className="text-sm mb-4 px-3 py-2 rounded-lg" style={{ background: "#fef3c7", color: "#92400e" }}>{reason}</p>}
+        <p className="text-sm opacity-70 mb-3">Pro removes every limit:</p>
+        <ul className="text-sm space-y-2 mb-5">
+          {[
+            "Unlimited Summarize cards",
+            "Unlimited price Alerts",
+            "Unlimited Catchup briefings",
+            "Unlimited Hawkeye cards",
+            "Unlimited watchlist & Compare library",
+            "Unlimited AI usage",
+          ].map((t, i) => (
+            <li key={i} className="flex items-center gap-2"><Check size={14} style={{ color: "#15803d" }} /> {t}</li>
+          ))}
+        </ul>
+        <button onClick={onClose} className="w-full py-2.5 rounded-lg text-white text-sm font-semibold" style={{ background: "#c2410c" }}>
+          Got it
+        </button>
+        <p className="text-[11px] opacity-40 text-center mt-3">Billing isn't wired up yet — contact the admin to be switched to Pro.</p>
+      </div>
+    </div>
+  );
+}
+
+function AccountModal({ profile, usage, onClose, onSignOut, onUpgrade }) {
+  const pro = isPro(profile);
+  return (
+    <div onClick={onClose} className="fixed inset-0 z-50 flex items-center justify-center p-4" style={{ background: "rgba(0,0,0,0.5)" }}>
+      <div onClick={e => e.stopPropagation()} className="w-full max-w-md rounded-2xl p-7 fade-in" style={{ background: "white" }}>
+        <div className="flex items-center justify-between mb-4">
+          <h3 className="font-serif-h text-xl font-semibold">Account</h3>
+          <button onClick={onClose} className="p-1 opacity-50 hover:opacity-100"><X size={16} /></button>
+        </div>
+        <div className="flex items-center gap-3 mb-5">
+          <div className="w-12 h-12 rounded-full flex items-center justify-center text-white font-semibold text-lg" style={{ background: profile?.is_admin ? "#c2410c" : "#1a1a1a" }}>
+            {(profile?.username || "?").slice(0, 1).toUpperCase()}
+          </div>
+          <div>
+            <div className="font-semibold flex items-center gap-2">
+              {profile?.username || "User"}
+              {profile?.is_admin && <span className="text-[10px] px-1.5 py-0.5 rounded-full flex items-center gap-1" style={{ background: "#fef3c7", color: "#92400e" }}><ShieldCheck size={9} /> Admin</span>}
+              {pro && !profile?.is_admin && <span className="text-[10px] px-1.5 py-0.5 rounded-full flex items-center gap-1" style={{ background: "#e0f2fe", color: "#0369a1" }}><Crown size={9} /> Pro</span>}
+              {!pro && <span className="text-[10px] px-1.5 py-0.5 rounded-full" style={{ background: "#f0f0ec", color: "#525252" }}>Free</span>}
+            </div>
+            <div className="text-xs opacity-50">{profile?.email}</div>
+          </div>
+        </div>
+
+        {!pro && (
+          <div className="rounded-xl p-4 mb-4" style={{ background: "#fafaf7", border: "1px solid #ececec" }}>
+            <div className="text-xs font-semibold mb-2 opacity-60">This month's usage</div>
+            <div className="space-y-1.5 text-xs">
+              <div className="flex justify-between"><span className="opacity-60">Summarize</span><span className="tabular-nums">{usage.summarize || 0} / {TIER_LIMITS.free.summarizePerMonth}</span></div>
+              <div className="flex justify-between"><span className="opacity-60">Catchup (all-time)</span><span className="tabular-nums">{usage.catchup || 0} / {TIER_LIMITS.free.catchupTotal}</span></div>
+            </div>
+            <button onClick={onUpgrade} className="w-full mt-3 py-2 rounded-lg text-white text-sm font-semibold flex items-center justify-center gap-1.5" style={{ background: "#c2410c" }}>
+              <Crown size={13} /> Upgrade to Pro
+            </button>
+          </div>
+        )}
+
+        <button onClick={onSignOut} className="w-full py-2.5 rounded-lg text-sm font-medium flex items-center justify-center gap-2" style={{ background: "#f0f0ec" }}>
+          <LogOut size={14} /> Sign out
+        </button>
+      </div>
+    </div>
+  );
+}
+
 export default function App() {
   const [state, setState]       = useState(DEFAULT_STATE);
   const [hydrated, setHydrated] = useState(false);
+
+  // ── Auth / account state ──────────────────────────────────────────────────
+  const [authChecked, setAuthChecked] = useState(false);   // have we resolved initial session?
+  const [session, setSession] = useState(null);
+  const [userProfile, setUserProfile] = useState(null);
+  const [authMode, setAuthMode] = useState(null);          // null | 'login' | 'register'
+  const [showAccount, setShowAccount] = useState(false);
+  const [upgradeReason, setUpgradeReason] = useState(null); // string => show upgrade modal
+  const [usageStats, setUsageStats] = useState({});         // { summarize, catchup }
+  const [claimPrompt, setClaimPrompt] = useState(false);    // offer to migrate anon data
   const [cloudStatus, setCloudStatus] = useState("connecting");
 
   const [quotes, setQuotes]         = useState({});
@@ -1421,7 +1677,50 @@ export default function App() {
   }, [totalUnread]);
 
   // Hydrate
+  // ── Resolve auth session on mount + subscribe to changes ──────────────────
   useEffect(() => {
+    if (!supabase) { setAuthChecked(true); return; }
+    let unsub = () => {};
+    (async () => {
+      const s = await getSession();
+      setSession(s);
+      if (s?.user) {
+        const p = await loadProfile();
+        setUserProfile(p);
+      }
+      setAuthChecked(true);
+    })();
+    unsub = onAuthChange(async (event, s) => {
+      setSession(s);
+      if (s?.user) {
+        const p = await loadProfile();
+        setUserProfile(p);
+        const anon = getAnonIdentity();
+        if (anon && anon !== s.user.id) setClaimPrompt(true);
+      } else {
+        setUserProfile(null);
+      }
+    });
+    return () => unsub();
+  }, []);
+
+  // Effective tier limits derived from profile
+  const limits = useMemo(() => effectiveLimits(userProfile), [userProfile]);
+  const userIsPro = useMemo(() => isPro(userProfile), [userProfile]);
+
+  const refreshUsage = async () => {
+    if (!supabase || !session?.user) return;
+    const [sum, cat] = await Promise.all([
+      getUsage('summarize', monthKey()),
+      getUsage('catchup', 'all-time'),
+    ]);
+    setUsageStats({ summarize: sum, catchup: cat });
+  };
+  useEffect(() => { if (session?.user) refreshUsage(); /* eslint-disable-next-line */ }, [session]);
+
+  // ── Main data hydration — only once authenticated ─────────────────────────
+  useEffect(() => {
+    if (!session?.user) return;
     (async () => {
       if (!supabase) { setCloudStatus("offline"); setHydrated(true); return; }
       try {
@@ -1465,7 +1764,7 @@ export default function App() {
       } catch { setCloudStatus("offline"); }
       setHydrated(true);
     })();
-  }, []);
+  }, [session]);
 
   useEffect(() => { if (hydrated) saveState(state); }, [state, hydrated]);
 
@@ -1667,6 +1966,17 @@ export default function App() {
   const addTicker = () => {
     const t = normalizeTicker(newTicker);
     if (!t) { if (newTicker.trim()) alert(TICKER_INPUT_HELP); return; }
+    // Free-tier watchlist cap (counts unique tickers across all groups).
+    if (!userIsPro) {
+      const allTickers = new Set([
+        ...state.sectorGroups.flatMap(g => g.tickers),
+        ...state.customGroups.flatMap(g => g.tickers),
+      ]);
+      if (!allTickers.has(t) && allTickers.size >= limits.watchlist) {
+        setUpgradeReason(`Free tier is limited to ${limits.watchlist} stocks in your watchlist. Upgrade to Pro for unlimited.`);
+        return;
+      }
+    }
     const targetId = newTickerGroup;
     updateState(s => {
       const upd = (groups) => groups.map(g => g.id === targetId && !g.tickers.includes(t) ? { ...g, tickers: [...g.tickers, t] } : g);
@@ -1769,6 +2079,11 @@ export default function App() {
 
   const createPriceAlert = async () => {
     setAlertError(null);
+    // Free-tier alert cap
+    if (!userIsPro && alerts.length >= limits.alerts) {
+      setUpgradeReason(`Free tier allows ${limits.alerts} price alert. Upgrade to Pro for unlimited alerts.`);
+      return;
+    }
     const tk = normalizeTicker(newAlertTicker);
     const target = parseFloat(newAlertPrice);
     if (!tk) { setAlertError(newAlertTicker.trim() ? TICKER_INPUT_HELP : "Please enter a ticker"); return; }
@@ -1816,6 +2131,11 @@ export default function App() {
 
   const createCatchupCard = async () => {
     setCuError(null);
+    // Free-tier catchup cap
+    if (!userIsPro && catchupCards.length >= limits.catchupTotal) {
+      setUpgradeReason(`Free tier allows ${limits.catchupTotal} Catchup. Upgrade to Pro for unlimited.`);
+      return;
+    }
     if (!cuName.trim()) { setCuError("Please give the card a name"); return; }
     const { valid: tickers, invalid: cuInvalid } = normalizeTickerList(cuTickers);
     if (cuInvalid.length > 0) { setCuError(`Invalid ticker(s): ${cuInvalid.join(", ")}. ${TICKER_INPUT_HELP}`); return; }
@@ -1896,6 +2216,11 @@ export default function App() {
 
   const createHawkeyeCard = async () => {
     setHkError(null);
+    // Free-tier hawkeye cap
+    if (!userIsPro && hawkeyeCards.length >= limits.hawkeye) {
+      setUpgradeReason(`Free tier allows ${limits.hawkeye} Hawkeye card. Upgrade to Pro for unlimited.`);
+      return;
+    }
     if (!hkName.trim()) { setHkError("Please give the card a name"); return; }
 
     let tickers = [];
@@ -2041,6 +2366,12 @@ export default function App() {
 
   // ── Compare: stock library handlers ───────────────────────────────────────
   const addCompareStock = async ({ ticker, name, marketTicker, currency, scaleFactor, parsed }) => {
+    // Free-tier compare library cap
+    if (!userIsPro && compareStocks.length >= limits.compareLibrary) {
+      setShowAddCompareStock(false);
+      setUpgradeReason(`Free tier allows ${limits.compareLibrary} stocks in your Compare library. Upgrade to Pro for unlimited.`);
+      return;
+    }
     const usedColors = new Set(compareStocks.map(s => s.color));
     const color = COMPARE_COLORS.find(c => !usedColors.has(c)) || COMPARE_COLORS[compareStocks.length % COMPARE_COLORS.length];
     const stock = {
@@ -2296,11 +2627,13 @@ export default function App() {
       };
       await saveCatchupCard(updated);
       setCatchupCards(prev => prev.map(c => c.id === card.id ? updated : c));
+      refreshUsage();
       // Auto-open the new summary so user sees it
       setOpenCatchupCards(prev => ({ ...prev, [card.id]: true }));
       setOpenCatchupSummaries(prev => ({ ...prev, [`${card.id}_${sumId}`]: true }));
     } catch (e) {
-      alert("Catchup generation failed: " + (e.message || e));
+      if (e.upgrade) { setUpgradeReason(e.message); }
+      else { alert("Catchup generation failed: " + (e.message || e)); }
     } finally {
       setGeneratingCatchup(prev => ({ ...prev, [card.id]: false }));
     }
@@ -2383,11 +2716,13 @@ export default function App() {
       };
       await saveSummary(row);
       setSummaries(prev => [row, ...prev]);
+      refreshUsage();
 
       // Reset form
       setSumTicker(""); setSumCustomTopic("");
     } catch (e) {
-      setSummaryError(e.message || String(e));
+      if (e.upgrade) { setUpgradeReason(e.message); }
+      else { setSummaryError(e.message || String(e)); }
     } finally {
       setGeneratingSummary(false);
     }
@@ -2415,6 +2750,32 @@ export default function App() {
       setNewTickerGroup(state.activeGroup || groups[0]?.id || "");
     }
   }, [showAddTicker]); // eslint-disable-line
+
+  // ── Auth gate ─────────────────────────────────────────────────────────────
+  // While Supabase is configured but session not yet resolved, show nothing
+  // (avoids a flash of the landing page for logged-in users).
+  if (supabase && !authChecked) {
+    return <div className="min-h-screen w-full flex items-center justify-center" style={{ background: "#fafaf7" }}>
+      <div className="text-sm opacity-40">Loading…</div>
+    </div>;
+  }
+
+  // Not logged in → static landing page with login/register.
+  if (supabase && !session) {
+    return (
+      <>
+        <LandingPage onLogin={() => setAuthMode("login")} onRegister={() => setAuthMode("register")} />
+        {authMode && (
+          <AuthModal
+            mode={authMode}
+            onClose={() => setAuthMode(null)}
+            onSwitchMode={(m) => setAuthMode(m)}
+            onAuthed={() => setAuthMode(null)}
+          />
+        )}
+      </>
+    );
+  }
 
   return (
     <div className="min-h-screen w-full">
@@ -2462,6 +2823,12 @@ export default function App() {
             <button onClick={() => { setSettingsDraft(modelPrefs); setShowSettings(true); }} className="p-1.5 rounded-full hover:bg-gray-100 transition opacity-60 hover:opacity-100" title="Settings">
               <Settings size={14} />
             </button>
+            <button onClick={() => { refreshUsage(); setShowAccount(true); }} className="flex items-center gap-1.5 pl-1.5 pr-2.5 py-1 rounded-full hover:bg-gray-100 transition" title="Account">
+              <span className="w-6 h-6 rounded-full flex items-center justify-center text-white font-semibold text-[11px]" style={{ background: userProfile?.is_admin ? "#c2410c" : "#1a1a1a" }}>
+                {(userProfile?.username || "?").slice(0, 1).toUpperCase()}
+              </span>
+              {userIsPro ? <Crown size={11} style={{ color: "#c2410c" }} /> : <span className="text-[9px] px-1 py-0.5 rounded-full" style={{ background: "#f0f0ec", color: "#525252" }}>Free</span>}
+            </button>
             <div className="relative">
               <Search size={14} className="absolute left-3 top-1/2 -translate-y-1/2 opacity-40" />
               <input value={search} onChange={e => setSearch(e.target.value)} placeholder="Search news" className="pl-9 pr-3 py-1.5 text-sm rounded-full border focus:outline-none focus:border-gray-900 transition" style={{ borderColor: "#e5e5e5", background: "white", width: 200 }} />
@@ -2471,6 +2838,23 @@ export default function App() {
       </header>
 
       {showSync && <SyncModal onClose={() => setShowSync(false)} />}
+      {showAccount && (
+        <AccountModal
+          profile={userProfile}
+          usage={usageStats}
+          onClose={() => setShowAccount(false)}
+          onSignOut={async () => { await signOut(); setShowAccount(false); setSession(null); setUserProfile(null); setHydrated(false); }}
+          onUpgrade={() => { setShowAccount(false); setUpgradeReason("Unlock unlimited access to every feature."); }}
+        />
+      )}
+      {upgradeReason && <UpgradeModal reason={upgradeReason} onClose={() => setUpgradeReason(null)} />}
+      {claimPrompt && (
+        <ConfirmModal
+          title="Bring your existing data?"
+          message="We found data saved on this device from before you had an account. Move it into your new account now? (This is a one-time action.)"
+          onConfirm={async () => { await claimAnonymousData(); setClaimPrompt(false); setHydrated(false); setSession(s => ({ ...s })); }}
+          onCancel={() => setClaimPrompt(false)} />
+      )}
       {showSettings && (
         <SettingsModal
           modelPrefs={modelPrefs}
