@@ -2,6 +2,7 @@
 // Generates a structured summary using the user-selected complex model.
 
 import { callLLM, estimateCost, isAnthropic, DEFAULT_COMPLEX_MODEL } from '../lib/llm.js';
+import { checkQuota, commitUsage } from '../lib/quota.js';
 
 const SYSTEM_INSTRUCTIONS = `You are a financial news analyst writing a structured summary for a personal stock dashboard.
 
@@ -151,6 +152,13 @@ export default async function handler(req, res) {
     return res.status(400).json({ error: 'ticker, period, fromDate, toDate required' });
   }
 
+  // ── Tier quota enforcement (server-side, authoritative) ──────────────────
+  const accessToken = (req.headers.authorization || '').replace(/^Bearer\s+/i, '');
+  const quota = await checkQuota(accessToken, 'summarize');
+  if (!quota.allowed) {
+    return res.status(429).json({ error: quota.reason, upgrade: true });
+  }
+
   const selectedModel = model || DEFAULT_COMPLEX_MODEL;
 
   const newsBlock = newsItems.length === 0
@@ -227,6 +235,9 @@ Output the JSON summary now. Be CONCISE — short descriptions, dense facts. You
     }
 
     parsed = cleanCitations(parsed);
+
+    // Count this successful, token-spending call against the user's monthly quota.
+    await commitUsage(quota.profile, 'summarize', quota.period);
 
     const costUSD = estimateCost(selectedModel, usage, searchUses);
 
