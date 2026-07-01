@@ -2,7 +2,6 @@
 // Generates a structured catchup briefing using the user-selected complex model.
 
 import { callLLM, estimateCost, isAnthropic, DEFAULT_COMPLEX_MODEL } from '../lib/llm.js';
-import { checkQuota, commitUsage } from '../lib/quota.js';
 
 const SYSTEM_INSTRUCTIONS = `You are a financial news analyst writing a catchup briefing for a personal stock dashboard. The user has set up a recurring routine to stay caught up on specific stocks and/or topics.
 
@@ -157,8 +156,18 @@ export default async function handler(req, res) {
   }
 
   // ── Tier quota enforcement (server-side, authoritative) ──────────────────
+  // Loaded dynamically so a problem in the quota module can never 500 the
+  // endpoint — if it fails to load, we simply allow the call (fail open).
   const accessToken = (req.headers.authorization || '').replace(/^Bearer\s+/i, '');
-  const quota = await checkQuota(accessToken, 'catchup');
+  let quota = { allowed: true, profile: null };
+  let commitUsageFn = async () => {};
+  try {
+    const mod = await import('../lib/quota.js');
+    quota = await mod.checkQuota(accessToken, 'catchup');
+    commitUsageFn = mod.commitUsage;
+  } catch (e) {
+    console.error('[catchup] quota module load failed (allowing call):', e?.message || e);
+  }
   if (!quota.allowed) {
     return res.status(429).json({ error: quota.reason, upgrade: true });
   }
@@ -248,7 +257,7 @@ Output the JSON briefing now. Be CONCISE and SPECIFIC. NO XML tags inside string
     parsed = cleanCitations(parsed);
 
     // Count this successful Catchup against the user's all-time quota.
-    await commitUsage(quota.profile, 'catchup', quota.period);
+    await commitUsageFn(quota.profile, 'catchup', quota.period);
 
     const costUSD = estimateCost(selectedModel, usage, searchUses);
 
@@ -274,4 +283,3 @@ Output the JSON briefing now. Be CONCISE and SPECIFIC. NO XML tags inside string
     res.status(500).json({ error: String(e.message || e), model: selectedModel });
   }
 }
-
