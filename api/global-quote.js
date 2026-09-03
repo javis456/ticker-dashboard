@@ -33,7 +33,19 @@ export default async function handler(req, res) {
   try {
     if (kind === 'quote' || kind === 'both') {
       try {
-        out.quote = await fetchQuote(symbol);
+        const qt = await fetchQuote(symbol);
+        out.quote = qt;
+        // Surface company name + basic metrics for the UI (foreign stocks).
+        out.profile = {
+          name:     qt.name || symbol,
+          currency: qt.currency || (getMarket(symbol)?.currency) || null,
+          exchange: qt.exchange || (getMarket(symbol)?.exchange) || null,
+        };
+        out.metrics = {
+          fiftyTwoWeekHigh: qt.fiftyTwoWeekHigh ?? null,
+          fiftyTwoWeekLow:  qt.fiftyTwoWeekLow ?? null,
+          marketCap:        qt.marketCap ?? null,
+        };
       } catch (e) {
         errors.push(`quote: ${e.message}`);
         out.quote = { c: 0, d: 0, dp: 0, h: 0, l: 0, o: 0, pc: 0, t: 0 };
@@ -62,3 +74,4 @@ export default async function handler(req, res) {
     return res.status(500).json({ error: String(e.message || e) });
   }
 }
+
