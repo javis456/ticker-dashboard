@@ -11,14 +11,16 @@ import {
   Settings, Cpu, Globe,
   Percent, BarChart3, Banknote, Scale, Users, Hammer, GitCompare, Coins,
   Library, FolderOpen, Save, Database,
-  LogOut, LogIn, User, Lock, Crown, ShieldCheck
+  LogOut, LogIn, User, Lock, Crown, ShieldCheck,
+  Upload, File, FileCode, StarOff, Download, Pencil, Hash
 } from "lucide-react";
 import { AreaChart, Area, XAxis, YAxis, Tooltip, ResponsiveContainer, BarChart, Bar, LineChart, Line, Legend, Cell, CartesianGrid } from "recharts";
-import { getQuote, getProfile, getNews, getCandles, classifyImpact, timeAgo } from "./lib/finnhub";
+import { getQuote, getProfile, getMetrics, getNews, getCandles, classifyImpact, timeAgo } from "./lib/finnhub";
 import { supabase, getIdentity, setIdentity, loadState, saveState,
   signUpWithEmail, signInWithEmail, signInWithGoogle, signOut, getSession, onAuthChange,
   loadProfile, updateUsername, getUsage, monthKey, claimAnonymousData, getAnonIdentity } from "./lib/supabase";
 import { TIER_LIMITS, effectiveLimits, isPro, FREE_LIMIT_LABELS } from "./lib/tiers";
+import { loadDocuments, uploadDocument, renameDocument, setDocumentStarred, setDocumentTags, deleteDocument, getDocumentUrl, fmtBytes, MAX_DOC_BYTES } from "./lib/docs";
 import { tagNews, AVAILABLE_TAGS, TAG_STYLES } from "./lib/tagger";
 import { loadSummaries, saveSummary, deleteSummary, generateSummary } from "./lib/summaries";
 import { loadUserEmail, saveUserEmail, loadAlerts, createAlert, stopAlert, deleteAlert } from "./lib/alerts";
@@ -1511,6 +1513,86 @@ function AccountModal({ profile, usage, onClose, onSignOut, onUpgrade }) {
   );
 }
 
+function UploadDocModal({ onClose, onUpload, uploading }) {
+  const [file, setFile] = useState(null);
+  const [name, setName] = useState("");
+  const [tagInput, setTagInput] = useState("");
+  const [error, setError] = useState("");
+  const [dragOver, setDragOver] = useState(false);
+
+  const pickFile = (f) => {
+    setError("");
+    if (!f) return;
+    const ext = f.name.toLowerCase().split(".").pop();
+    const okType = f.type === "application/pdf" || f.type === "text/html" || ext === "pdf" || ext === "html" || ext === "htm";
+    if (!okType) { setError("Only PDF and HTML files are supported."); return; }
+    if (f.size > 5 * 1024 * 1024) { setError("File exceeds the 5 MB limit."); return; }
+    setFile(f);
+    if (!name) setName(f.name.replace(/\.[^.]+$/, ""));
+  };
+
+  const submit = async () => {
+    if (!file) { setError("Choose a file first."); return; }
+    const tags = tagInput.split(",").map(t => t.trim()).filter(Boolean);
+    await onUpload(file, { name: name.trim() || file.name, tags });
+  };
+
+  return (
+    <div onClick={onClose} className="fixed inset-0 z-50 flex items-center justify-center p-4" style={{ background: "rgba(0,0,0,0.5)" }}>
+      <div onClick={e => e.stopPropagation()} className="w-full max-w-lg rounded-2xl p-6 fade-in" style={{ background: "white" }}>
+        <div className="flex items-center justify-between mb-1">
+          <h3 className="font-serif-h text-xl font-semibold">Upload a file</h3>
+          <button onClick={onClose} className="p-1 opacity-50 hover:opacity-100"><X size={16} /></button>
+        </div>
+        <p className="text-sm opacity-60 mb-4">PDF or HTML, up to 5 MB.</p>
+
+        <div
+          onDragOver={e => { e.preventDefault(); setDragOver(true); }}
+          onDragLeave={() => setDragOver(false)}
+          onDrop={e => { e.preventDefault(); setDragOver(false); pickFile(e.dataTransfer.files?.[0]); }}
+          className="rounded-xl p-6 text-center mb-4 transition-colors"
+          style={{ border: `2px dashed ${dragOver ? "#7c3aed" : "#d4d4d4"}`, background: dragOver ? "#faf5ff" : "#fafaf7" }}>
+          {file ? (
+            <div className="flex items-center justify-center gap-2 text-sm">
+              <File size={16} style={{ color: "#7c3aed" }} />
+              <span className="font-medium">{file.name}</span>
+              <span className="opacity-40 text-xs">({(file.size/1e6).toFixed(1)} MB)</span>
+            </div>
+          ) : (
+            <>
+              <Upload size={24} className="mx-auto mb-2 opacity-30" />
+              <p className="text-sm opacity-60 mb-2">Drag a file here, or</p>
+              <label className="text-sm px-3 py-1.5 rounded-lg font-medium cursor-pointer inline-block" style={{ background: "#f0f0ec" }}>
+                Browse
+                <input type="file" accept=".pdf,.html,.htm,application/pdf,text/html" className="hidden" onChange={e => pickFile(e.target.files?.[0])} />
+              </label>
+            </>
+          )}
+        </div>
+
+        <div className="mb-3">
+          <label className="text-xs font-semibold block mb-1">Name</label>
+          <input value={name} onChange={e => setName(e.target.value)} placeholder="Display name" className="w-full text-sm px-3 py-2 rounded-lg focus:outline-none" style={{ background: "#fafaf7", border: "1px solid #e5e5e5" }} />
+        </div>
+        <div className="mb-4">
+          <label className="text-xs font-semibold block mb-1">Tags (optional)</label>
+          <input value={tagInput} onChange={e => setTagInput(e.target.value)} placeholder="e.g. earnings, semiconductors, research" className="w-full text-sm px-3 py-2 rounded-lg focus:outline-none" style={{ background: "#fafaf7", border: "1px solid #e5e5e5" }} />
+          <p className="text-[10px] opacity-40 mt-1">Comma-separate multiple tags. You can search by these later.</p>
+        </div>
+
+        {error && <div className="text-xs px-3 py-2 rounded-lg mb-3" style={{ background: "#fee2e2", color: "#991b1b" }}>{error}</div>}
+
+        <div className="flex gap-2">
+          <button onClick={submit} disabled={uploading || !file} className="flex-1 py-2 rounded-md text-white text-sm font-medium disabled:opacity-40" style={{ background: "#1a1a1a" }}>
+            {uploading ? "Uploading…" : "Upload"}
+          </button>
+          <button onClick={onClose} className="px-4 py-2 rounded-md text-sm" style={{ background: "#f0f0ec" }}>Cancel</button>
+        </div>
+      </div>
+    </div>
+  );
+}
+
 export default function App() {
   const [state, setState]       = useState(DEFAULT_STATE);
   const [hydrated, setHydrated] = useState(false);
@@ -1528,6 +1610,7 @@ export default function App() {
 
   const [quotes, setQuotes]         = useState({});
   const [profiles, setProfiles]     = useState({});
+  const [metricsByTicker, setMetricsByTicker] = useState({});   // { ticker: { marketCap, peRatio, ... } }
   const [newsByTicker, setNewsByTicker] = useState({});
   const [loadingTicker, setLoadingTicker] = useState({});
 
@@ -1591,6 +1674,20 @@ export default function App() {
   const [hawkeyeCards, setHawkeyeCards] = useState([]);
 
   // Compare feature state
+  // Docs feature state (Pro-only)
+  const [documents, setDocuments] = useState([]);
+  const [docsLoading, setDocsLoading] = useState(false);
+  const [docSort, setDocSort] = useState("recent");        // recent | name | size
+  const [docSearch, setDocSearch] = useState("");
+  const [docTagFilter, setDocTagFilter] = useState(null);  // active tag filter
+  const [docStarredOnly, setDocStarredOnly] = useState(false);
+  const [showUploadDoc, setShowUploadDoc] = useState(false);
+  const [docUploading, setDocUploading] = useState(false);
+  const [docRenameId, setDocRenameId] = useState(null);
+  const [docRenameValue, setDocRenameValue] = useState("");
+  const [docDeleteId, setDocDeleteId] = useState(null);
+  const [docTagEditId, setDocTagEditId] = useState(null);
+
   const [compareStocks, setCompareStocks] = useState([]);      // the library (all saved stocks)
   const [compareGroups, setCompareGroups] = useState([]);      // saved named groups
   const [activeGroupId, setActiveGroupId] = useState("");
@@ -1760,6 +1857,10 @@ export default function App() {
         const grps = await loadCompareGroups();
         setCompareGroups(grps);
         if (grps.length > 0) setActiveGroupId(grps[0].id);
+        // Docs (Pro-only) — load if the user is pro/admin
+        if (isPro(userProfile)) {
+          loadDocuments().then(setDocuments).catch(() => {});
+        }
         setCloudStatus("synced");
       } catch { setCloudStatus("offline"); }
       setHydrated(true);
@@ -1804,6 +1905,8 @@ export default function App() {
         ...item, impact: classifyImpact(item.headline), tAgo: timeAgo(item.datetime),
       }));
       setNewsByTicker(prev => ({ ...prev, [tk]: articles }));
+      // Metrics are secondary — fetch without blocking the main load.
+      getMetrics(tk).then(m => { if (m) setMetricsByTicker(prev => ({ ...prev, [tk]: m })); }).catch(() => {});
     } finally {
       setLoadingTicker(prev => ({ ...prev, [tk]: false }));
     }
@@ -2499,6 +2602,79 @@ export default function App() {
     [compareUsd, activeStocks]
   );
 
+  // ── Docs handlers (Pro-only) ──────────────────────────────────────────────
+  const doUploadDocument = async (file, { name, tags }) => {
+    setDocUploading(true);
+    try {
+      const { doc, error } = await uploadDocument(file, { name, tags });
+      if (error) { alert("Upload failed: " + error); return false; }
+      setDocuments(prev => [doc, ...prev]);
+      setShowUploadDoc(false);
+      return true;
+    } finally {
+      setDocUploading(false);
+    }
+  };
+
+  const doRenameDocument = async (id, name) => {
+    if (!name.trim()) { setDocRenameId(null); return; }
+    setDocuments(prev => prev.map(d => d.id === id ? { ...d, name: name.trim() } : d));
+    setDocRenameId(null);
+    await renameDocument(id, name.trim());
+  };
+
+  const doToggleStar = async (doc) => {
+    const next = !doc.starred;
+    setDocuments(prev => prev.map(d => d.id === doc.id ? { ...d, starred: next } : d));
+    await setDocumentStarred(doc.id, next);
+  };
+
+  const doSetDocTags = async (id, tags) => {
+    setDocuments(prev => prev.map(d => d.id === id ? { ...d, tags } : d));
+    await setDocumentTags(id, tags);
+  };
+
+  const doDeleteDocument = async (id) => {
+    const doc = documents.find(d => d.id === id);
+    if (!doc) { setDocDeleteId(null); return; }
+    setDocuments(prev => prev.filter(d => d.id !== id));
+    setDocDeleteId(null);
+    await deleteDocument(doc);
+  };
+
+  const openDocument = async (doc) => {
+    const url = await getDocumentUrl(doc);
+    if (url) window.open(url, "_blank", "noopener");
+    else alert("Could not open the file.");
+  };
+
+  // Derived: all tags across documents, and the filtered/sorted view
+  const allDocTags = useMemo(() => {
+    const set = new Set();
+    documents.forEach(d => (d.tags || []).forEach(t => set.add(t)));
+    return [...set].sort();
+  }, [documents]);
+
+  const visibleDocuments = useMemo(() => {
+    let list = [...documents];
+    if (docStarredOnly) list = list.filter(d => d.starred);
+    if (docTagFilter) list = list.filter(d => (d.tags || []).includes(docTagFilter));
+    if (docSearch.trim()) {
+      const q = docSearch.trim().toLowerCase();
+      list = list.filter(d =>
+        d.name.toLowerCase().includes(q) ||
+        (d.tags || []).some(t => t.toLowerCase().includes(q))
+      );
+    }
+    list.sort((a, b) => {
+      if (docSort === "name") return a.name.localeCompare(b.name);
+      if (docSort === "size") return (b.sizeBytes || 0) - (a.sizeBytes || 0);
+      return (b.createdAt || "").localeCompare(a.createdAt || "");   // recent
+    });
+    // Starred always float to top within the chosen sort
+    return list.sort((a, b) => (b.starred ? 1 : 0) - (a.starred ? 1 : 0));
+  }, [documents, docStarredOnly, docTagFilter, docSearch, docSort]);
+
   // ── History paste handlers ────────────────────────────────────────────────
   const previewPasteForTicker = (ticker, text) => {
     setHkHistoryByTicker(prev => ({
@@ -2796,6 +2972,7 @@ export default function App() {
                 { id: "catchup",   label: "Catchup",   badge: overdueCount, badgeColor: "#dc2626" },
                 { id: "hawkeye",   label: "Hawkeye",   badge: hawkeyeUnreadCount, badgeColor: "#7c3aed" },
                 { id: "compare",   label: "Compare",   badge: compareGroups.length, badgeColor: "#0369a1" },
+                { id: "docs",      label: "Docs",      badge: userIsPro ? documents.length : 0, badgeColor: "#7c3aed" },
               ].map(tab => (
                 <button key={tab.id} onClick={() => setView(tab.id)} className="px-3 py-1.5 text-sm rounded-full transition-all flex items-center gap-1.5"
                   style={{ background: view === tab.id ? "#1a1a1a" : "transparent", color: view === tab.id ? "#fafaf7" : "#1a1a1a" }}>
@@ -2912,6 +3089,20 @@ export default function App() {
           message="The group is removed, but the stocks' financial data stays in your library and can be reused in other groups."
           onConfirm={() => removeCompareGroup(compareDeleteGroupId)}
           onCancel={() => setCompareDeleteGroupId(null)} />
+      )}
+      {showUploadDoc && (
+        <UploadDocModal
+          onClose={() => setShowUploadDoc(false)}
+          onUpload={doUploadDocument}
+          uploading={docUploading}
+        />
+      )}
+      {docDeleteId && (
+        <ConfirmModal
+          title="Delete this file?"
+          message="This permanently removes the file and its metadata. This cannot be undone."
+          onConfirm={() => doDeleteDocument(docDeleteId)}
+          onCancel={() => setDocDeleteId(null)} />
       )}
       {confirmDelete && (
         <ConfirmModal
@@ -3067,6 +3258,37 @@ export default function App() {
                     ))}
                   </div>
                 )}
+                {(() => {
+                  const m = metricsByTicker[selected];
+                  if (!m) return null;
+                  const fmtBig = v => {
+                    if (v == null || isNaN(v)) return "—";
+                    const a = Math.abs(v);
+                    if (a >= 1e12) return `${(v/1e12).toFixed(2)}T`;
+                    if (a >= 1e9)  return `${(v/1e9).toFixed(2)}B`;
+                    if (a >= 1e6)  return `${(v/1e6).toFixed(2)}M`;
+                    return v.toLocaleString();
+                  };
+                  const cells = [
+                    { label: "Market Cap", val: m.marketCap != null ? fmtBig(m.marketCap) : "—" },
+                    { label: "P/E", val: m.peRatio != null ? m.peRatio.toFixed(1) : "—" },
+                    { label: "EPS", val: m.eps != null ? m.eps.toFixed(2) : "—" },
+                    { label: "52W High", val: m.high52 != null ? m.high52.toLocaleString(undefined,{maximumFractionDigits:2}) : "—" },
+                    { label: "52W Low", val: m.low52 != null ? m.low52.toLocaleString(undefined,{maximumFractionDigits:2}) : "—" },
+                    { label: "Div Yield", val: m.dividendYield != null ? `${m.dividendYield.toFixed(2)}%` : "—" },
+                  ].filter(c => c.val !== "—");
+                  if (cells.length === 0) return null;
+                  return (
+                    <div className="mt-3 pt-3 border-t flex flex-wrap gap-x-6 gap-y-2" style={{ borderColor: "#f0f0ec" }}>
+                      {cells.map(c => (
+                        <div key={c.label} className="flex items-baseline gap-1.5">
+                          <span className="text-[10px] tracking-widest uppercase opacity-40">{c.label}</span>
+                          <span className="text-sm font-semibold tabular-nums">{c.val}</span>
+                        </div>
+                      ))}
+                    </div>
+                  );
+                })()}
               </section>
 
               <section>
@@ -4602,6 +4824,128 @@ export default function App() {
               )}
             </section>
           )}
+
+          {view === "docs" && (
+            <section>
+              {!userIsPro ? (
+                <div className="rounded-2xl p-12 text-center" style={{ background: "white", border: "1px dashed #d4d4d4" }}>
+                  <Crown size={32} className="mx-auto mb-3" style={{ color: "#c2410c" }} />
+                  <h2 className="font-serif-h text-2xl font-semibold mb-1">Docs is a Pro feature</h2>
+                  <p className="text-sm opacity-60 mb-4 max-w-md mx-auto">Upload, tag, and organize your research files (PDF & HTML). Upgrade to Pro to unlock document storage.</p>
+                  <button onClick={() => setUpgradeReason("Docs lets you store and organize research files. Upgrade to Pro to use it.")} className="text-sm px-5 py-2.5 rounded-lg text-white font-semibold" style={{ background: "#c2410c" }}>
+                    <Crown size={13} className="inline mr-1" /> Upgrade to Pro
+                  </button>
+                </div>
+              ) : (
+                <>
+                  <div className="mb-6 flex items-start justify-between gap-4 flex-wrap">
+                    <div>
+                      <h2 className="font-serif-h text-3xl font-semibold mb-1">Docs</h2>
+                      <p className="text-sm opacity-60 max-w-2xl">Your research files. Upload PDF or HTML (up to 5&nbsp;MB each), tag them, star favorites, and search by name or tag.</p>
+                    </div>
+                    <button onClick={() => setShowUploadDoc(true)} className="flex items-center gap-1.5 text-sm px-4 py-2 rounded-lg text-white font-medium" style={{ background: "#1a1a1a" }}>
+                      <Upload size={14} /> Upload file
+                    </button>
+                  </div>
+
+                  {/* Controls */}
+                  <div className="flex items-center gap-3 mb-5 flex-wrap">
+                    <div className="relative">
+                      <Search size={13} className="absolute left-3 top-1/2 -translate-y-1/2 opacity-40" />
+                      <input value={docSearch} onChange={e => setDocSearch(e.target.value)} placeholder="Search by name or tag" className="pl-8 pr-3 py-1.5 text-sm rounded-lg focus:outline-none" style={{ background: "white", border: "1px solid #ececec", width: 240 }} />
+                    </div>
+                    <button onClick={() => setDocStarredOnly(v => !v)} className="flex items-center gap-1.5 text-sm px-3 py-1.5 rounded-lg font-medium" style={{ background: docStarredOnly ? "#fef3c7" : "white", color: docStarredOnly ? "#92400e" : "#1a1a1a", border: "1px solid #ececec" }}>
+                      <Star size={13} className={docStarredOnly ? "fill-current" : ""} /> Starred
+                    </button>
+                    <div className="flex items-center gap-1 rounded-lg p-1" style={{ background: "#f0f0ec" }}>
+                      <span className="text-[11px] opacity-50 px-2">Sort</span>
+                      {[["recent","Recent"],["name","Name"],["size","Size"]].map(([k,lbl]) => (
+                        <button key={k} onClick={() => setDocSort(k)} className="text-xs px-2 py-1 rounded-md font-medium" style={{ background: docSort === k ? "white" : "transparent", boxShadow: docSort === k ? "0 1px 2px rgba(0,0,0,0.06)" : "none" }}>{lbl}</button>
+                      ))}
+                    </div>
+                  </div>
+
+                  {/* Tag chips */}
+                  {allDocTags.length > 0 && (
+                    <div className="flex items-center gap-2 mb-5 flex-wrap">
+                      <span className="text-[11px] opacity-40 flex items-center gap-1"><Hash size={11} /> Tags:</span>
+                      {docTagFilter && (
+                        <button onClick={() => setDocTagFilter(null)} className="text-xs px-2.5 py-1 rounded-full" style={{ background: "#1a1a1a", color: "white" }}>Clear</button>
+                      )}
+                      {allDocTags.map(tag => (
+                        <button key={tag} onClick={() => setDocTagFilter(docTagFilter === tag ? null : tag)} className="text-xs px-2.5 py-1 rounded-full transition-all" style={{ background: docTagFilter === tag ? "#7c3aed" : "white", color: docTagFilter === tag ? "white" : "#525252", border: "1px solid #ececec" }}>
+                          {tag}
+                        </button>
+                      ))}
+                    </div>
+                  )}
+
+                  {/* File list */}
+                  {visibleDocuments.length === 0 ? (
+                    <div className="rounded-2xl p-12 text-center" style={{ background: "white", border: "1px dashed #d4d4d4" }}>
+                      <FileText size={30} className="mx-auto mb-3 opacity-30" />
+                      <p className="text-sm opacity-60 mb-1">{documents.length === 0 ? "No files yet." : "No files match your filters."}</p>
+                      {documents.length === 0 && <p className="text-xs opacity-40 mb-4">Upload a PDF or HTML file to get started.</p>}
+                      {documents.length === 0 && (
+                        <button onClick={() => setShowUploadDoc(true)} className="text-sm px-4 py-2 rounded-lg text-white font-medium" style={{ background: "#1a1a1a" }}>
+                          <Upload size={13} className="inline mr-1" /> Upload your first file
+                        </button>
+                      )}
+                    </div>
+                  ) : (
+                    <div className="space-y-2">
+                      {visibleDocuments.map(doc => (
+                        <div key={doc.id} className="flex items-center gap-3 p-3 rounded-xl group" style={{ background: "white", border: "1px solid #ececec" }}>
+                          <div className="w-9 h-9 rounded-lg flex items-center justify-center flex-shrink-0" style={{ background: doc.fileType === "pdf" ? "#fee2e2" : "#e0f2fe" }}>
+                            {doc.fileType === "pdf" ? <File size={16} style={{ color: "#dc2626" }} /> : <FileCode size={16} style={{ color: "#0369a1" }} />}
+                          </div>
+                          <div className="min-w-0 flex-1">
+                            {docRenameId === doc.id ? (
+                              <input autoFocus value={docRenameValue} onChange={e => setDocRenameValue(e.target.value)}
+                                onKeyDown={e => { if (e.key === "Enter") doRenameDocument(doc.id, docRenameValue); if (e.key === "Escape") setDocRenameId(null); }}
+                                onBlur={() => doRenameDocument(doc.id, docRenameValue)}
+                                className="text-sm font-medium px-2 py-1 rounded w-full focus:outline-none" style={{ border: "1px solid #7c3aed" }} />
+                            ) : (
+                              <button onClick={() => openDocument(doc)} className="text-sm font-medium hover:underline text-left truncate block w-full">{doc.name}</button>
+                            )}
+                            <div className="flex items-center gap-2 mt-0.5 flex-wrap">
+                              <span className="text-[11px] opacity-40 uppercase">{doc.fileType}</span>
+                              <span className="text-[11px] opacity-40">{fmtBytes(doc.sizeBytes)}</span>
+                              {(doc.tags || []).map(t => (
+                                <span key={t} className="text-[10px] px-1.5 py-0.5 rounded-full" style={{ background: "#f3e8ff", color: "#7c3aed" }}>{t}</span>
+                              ))}
+                              <button onClick={() => { setDocTagEditId(doc.id); }} className="text-[10px] opacity-40 hover:opacity-100 flex items-center gap-0.5"><Plus size={9} /> tag</button>
+                            </div>
+                            {docTagEditId === doc.id && (
+                              <input autoFocus placeholder="Type a tag, press Enter (comma-separate for multiple)"
+                                onKeyDown={e => {
+                                  if (e.key === "Enter") {
+                                    const newTags = e.target.value.split(",").map(t => t.trim()).filter(Boolean);
+                                    const merged = [...new Set([...(doc.tags||[]), ...newTags])];
+                                    doSetDocTags(doc.id, merged); setDocTagEditId(null);
+                                  }
+                                  if (e.key === "Escape") setDocTagEditId(null);
+                                }}
+                                onBlur={() => setDocTagEditId(null)}
+                                className="text-xs px-2 py-1 rounded mt-1 w-full focus:outline-none" style={{ border: "1px solid #7c3aed" }} />
+                            )}
+                          </div>
+                          <div className="flex items-center gap-1 flex-shrink-0">
+                            <button onClick={() => doToggleStar(doc)} className="p-1.5 rounded hover:bg-gray-100" title={doc.starred ? "Unstar" : "Star"}>
+                              <Star size={14} className={doc.starred ? "fill-current" : ""} style={{ color: doc.starred ? "#f59e0b" : "#a3a3a3" }} />
+                            </button>
+                            <button onClick={() => openDocument(doc)} className="p-1.5 rounded hover:bg-gray-100" title="Open / download"><Download size={14} style={{ color: "#525252" }} /></button>
+                            <button onClick={() => { setDocRenameId(doc.id); setDocRenameValue(doc.name); }} className="p-1.5 rounded hover:bg-gray-100" title="Rename"><Pencil size={13} style={{ color: "#525252" }} /></button>
+                            <button onClick={() => setDocDeleteId(doc.id)} className="p-1.5 rounded hover:bg-gray-100" title="Delete"><Trash2 size={13} style={{ color: "#dc2626" }} /></button>
+                          </div>
+                        </div>
+                      ))}
+                    </div>
+                  )}
+                </>
+              )}
+            </section>
+          )}
         </main>
       </div>
 
@@ -4614,3 +4958,4 @@ export default function App() {
     </div>
   );
 }
+
