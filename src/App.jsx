@@ -1857,15 +1857,20 @@ export default function App() {
         const grps = await loadCompareGroups();
         setCompareGroups(grps);
         if (grps.length > 0) setActiveGroupId(grps[0].id);
-        // Docs (Pro-only) — load if the user is pro/admin
-        if (isPro(userProfile)) {
-          loadDocuments().then(setDocuments).catch(() => {});
-        }
         setCloudStatus("synced");
       } catch { setCloudStatus("offline"); }
       setHydrated(true);
     })();
   }, [session]);
+
+  // Load Docs once we know the user is Pro/admin. Kept separate from the main
+  // hydration because userProfile resolves on its own async timeline — gating
+  // docs inside hydration raced the profile load and left the list empty.
+  useEffect(() => {
+    if (!session?.user) return;
+    if (!isPro(userProfile)) return;
+    loadDocuments().then(setDocuments).catch(() => {});
+  }, [session, userProfile]);
 
   useEffect(() => { if (hydrated) saveState(state); }, [state, hydrated]);
 
@@ -4958,4 +4963,3 @@ export default function App() {
     </div>
   );
 }
-
