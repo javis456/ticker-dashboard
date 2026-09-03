@@ -47,9 +47,13 @@ export async function uploadDocument(file, { name, tags = [] } = {}) {
   const safeName = (name || file.name).replace(/[^\w.\-]+/g, '_').slice(0, 80);
   const path = `${identity}/${id}_${safeName}`;
 
+  // Force the correct content type. Browser-reported file.type is often empty or
+  // 'application/octet-stream' for Claude-generated HTML, which would otherwise
+  // make it download rather than render. Derive it from the detected kind.
+  const contentType = kind === 'pdf' ? 'application/pdf' : 'text/html';
   const { error: upErr } = await supabase.storage
     .from(BUCKET)
-    .upload(path, file, { contentType: file.type, upsert: false });
+    .upload(path, file, { contentType, upsert: false });
   if (upErr) { console.warn('[docs] upload error', upErr); return { error: upErr.message }; }
 
   const doc = {
@@ -99,13 +103,46 @@ export async function deleteDocument(doc) {
 }
 
 // Get a temporary signed URL to view/download a file (bucket is private).
-export async function getDocumentUrl(doc) {
+export async function getDocumentUrl(doc, { download = false } = {}) {
+  if (!supabase) return null;
+  const opts = download ? { download: true } : {};
+  const { data, error } = await supabase.storage
+    .from(BUCKET)
+    .createSignedUrl(doc.filePath, 60 * 10, opts);   // 10 minutes
+  if (error) { console.warn('[docs] signed url error', error); return null; }
+  return data?.signedUrl || null;
+}
+
+// Download the raw file bytes. Returns a Blob (or null).
+// Used to render HTML inside the app (Supabase Storage won't render HTML inline
+// itself — it serves it with a restrictive CSP / forces download — so we fetch
+// the bytes and render them in a sandboxed iframe within our own page instead).
+export async function downloadDocumentBlob(doc) {
   if (!supabase) return null;
   const { data, error } = await supabase.storage
     .from(BUCKET)
-    .createSignedUrl(doc.filePath, 60 * 10);   // 10 minutes
-  if (error) { console.warn('[docs] signed url error', error); return null; }
-  return data?.signedUrl || null;
+    .download(doc.filePath);
+  if (error) { console.warn('[docs] download error', error); return null; }
+  return data || null;   // Blob
+}
+
+// Fetch an HTML document's text content, ready to inject into an iframe srcdoc.
+export async function fetchDocumentHtml(doc) {
+  const blob = await downloadDocumentBlob(doc);
+  if (!blob) return null;
+  try { return await blob.text(); }
+  catch { return null; }
+}
+
+// Build an object URL for a blob (used for PDF viewing in an iframe/embed).
+export async function documentObjectUrl(doc) {
+  const blob = await downloadDocumentBlob(doc);
+  if (!blob) return null;
+  // Ensure the blob has the right type so the browser renders it correctly.
+  const typed = doc.fileType === 'pdf'
+    ? new Blob([blob], { type: 'application/pdf' })
+    : new Blob([blob], { type: 'text/html' });
+  return URL.createObjectURL(typed);
 }
 
 export function fmtBytes(n) {
