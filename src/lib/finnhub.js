@@ -78,17 +78,68 @@ export async function getProfile(symbol) {
       return fetchJson(`${FH_BASE}/stock/profile2?symbol=${parsed.code}&token=${FINNHUB_KEY}`);
     }
 
-    // Non-US: Yahoo proxy doesn't fetch full company profiles (kept lean to avoid
-    // extra Yahoo calls). We return a minimal profile from the market registry.
-    const market = getMarket(symbol);
-    return {
-      name:            symbol,
-      ticker:          symbol,
-      exchange:        market?.exchange || '',
-      finnhubIndustry: '',
-      weburl:          '',
-      logo:            '',
-    };
+    // Non-US: fetch the real company name (+ basic info) from the Yahoo proxy,
+    // which returns it in the `profile` block. Cached like any profile.
+    try {
+      const data = await fetchGlobal(symbol, 'quote');
+      const market = getMarket(symbol);
+      const p = data.profile || {};
+      return {
+        name:            p.name || symbol,
+        ticker:          symbol,
+        exchange:        p.exchange || market?.exchange || '',
+        currency:        p.currency || market?.currency || '',
+        finnhubIndustry: '',
+        weburl:          '',
+        logo:            '',
+      };
+    } catch {
+      const market = getMarket(symbol);
+      return {
+        name: symbol, ticker: symbol, exchange: market?.exchange || '',
+        finnhubIndustry: '', weburl: '', logo: '',
+      };
+    }
+  });
+}
+
+// ---- Basic metrics: { marketCap, peRatio, eps, high52, low52, ... } ----
+// US: Finnhub /stock/metric. Non-US: whatever Yahoo chart meta gives us.
+export async function getMetrics(symbol) {
+  return cached(`metrics:${symbol}`, CACHE_TTL.profile, async () => {
+    const parsed = parseTicker(symbol);
+    if (!parsed) return {};
+
+    if (parsed.market === 'US') {
+      try {
+        const data = await fetchJson(`${FH_BASE}/stock/metric?symbol=${parsed.code}&metric=all&token=${FINNHUB_KEY}`);
+        const m = data?.metric || {};
+        return {
+          marketCap: m.marketCapitalization != null ? m.marketCapitalization * 1e6 : null, // Finnhub gives $M
+          peRatio:   m.peTTM ?? m.peBasicExclExtraTTM ?? null,
+          eps:       m.epsTTM ?? null,
+          high52:    m['52WeekHigh'] ?? null,
+          low52:     m['52WeekLow'] ?? null,
+          dividendYield: m.dividendYieldIndicatedAnnual ?? null,
+          beta:      m.beta ?? null,
+        };
+      } catch { return {}; }
+    }
+
+    // Non-US: from the Yahoo proxy metrics block (limited but free).
+    try {
+      const data = await fetchGlobal(symbol, 'quote');
+      const m = data.metrics || {};
+      return {
+        marketCap: m.marketCap ?? null,
+        peRatio:   null,          // not in chart meta
+        eps:       null,
+        high52:    m.fiftyTwoWeekHigh ?? null,
+        low52:     m.fiftyTwoWeekLow ?? null,
+        dividendYield: null,
+        beta:      null,
+      };
+    } catch { return {}; }
   });
 }
 
@@ -204,3 +255,4 @@ export function timeAgo(unixSeconds) {
   if (diff < 86400) return `${Math.floor(diff / 3600)}h`;
   return `${Math.floor(diff / 86400)}d`;
 }
+
