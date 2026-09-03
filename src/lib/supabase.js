@@ -82,7 +82,13 @@ export async function signOut() {
 export async function getSession() {
   if (!supabase) return null;
   const { data } = await supabase.auth.getSession();
-  return data?.session || null;
+  const session = data?.session || null;
+  // CRITICAL: set the identity here too. On a page refresh the app calls
+  // getSession() before onAuthChange fires; without this, getIdentity() would
+  // fall back to the anonymous id and data (docs, etc.) keyed to the account
+  // wouldn't load. Keep currentUserId in sync with the resolved session.
+  setCurrentUserId(session?.user?.id || null);
+  return session;
 }
 
 export function onAuthChange(callback) {
@@ -177,3 +183,4 @@ export function saveState(state) {
     if (error) console.error('[Ticker] saveState ERROR:', error);
   }, 800);
 }
+
