@@ -20,7 +20,7 @@ import { supabase, getIdentity, setIdentity, loadState, saveState,
   signUpWithEmail, signInWithEmail, signInWithGoogle, signOut, getSession, onAuthChange,
   loadProfile, updateUsername, getUsage, monthKey, claimAnonymousData, getAnonIdentity } from "./lib/supabase";
 import { TIER_LIMITS, effectiveLimits, isPro, FREE_LIMIT_LABELS } from "./lib/tiers";
-import { loadDocuments, uploadDocument, renameDocument, setDocumentStarred, setDocumentTags, deleteDocument, getDocumentUrl, fmtBytes, MAX_DOC_BYTES } from "./lib/docs";
+import { loadDocuments, uploadDocument, renameDocument, setDocumentStarred, setDocumentTags, deleteDocument, getDocumentUrl, fetchDocumentHtml, documentObjectUrl, fmtBytes, MAX_DOC_BYTES } from "./lib/docs";
 import { tagNews, AVAILABLE_TAGS, TAG_STYLES } from "./lib/tagger";
 import { loadSummaries, saveSummary, deleteSummary, generateSummary } from "./lib/summaries";
 import { loadUserEmail, saveUserEmail, loadAlerts, createAlert, stopAlert, deleteAlert } from "./lib/alerts";
@@ -1593,6 +1593,58 @@ function UploadDocModal({ onClose, onUpload, uploading }) {
   );
 }
 
+function DocViewerModal({ doc, content, loading, onClose, onDownload }) {
+  if (!doc) return null;
+  return (
+    <div className="fixed inset-0 z-50 flex flex-col" style={{ background: "rgba(0,0,0,0.75)" }}>
+      {/* Top bar */}
+      <div className="flex items-center justify-between px-5 py-3" style={{ background: "#1a1a1a" }}>
+        <div className="flex items-center gap-2 min-w-0">
+          {doc.fileType === "pdf" ? <File size={15} style={{ color: "#f87171" }} /> : <FileCode size={15} style={{ color: "#60a5fa" }} />}
+          <span className="text-sm font-medium text-white truncate">{doc.name}</span>
+          <span className="text-[10px] uppercase px-1.5 py-0.5 rounded-full" style={{ background: "rgba(255,255,255,0.15)", color: "white" }}>{doc.fileType}</span>
+        </div>
+        <div className="flex items-center gap-2">
+          <button onClick={() => onDownload(doc)} className="flex items-center gap-1.5 text-xs px-3 py-1.5 rounded-lg font-medium" style={{ background: "rgba(255,255,255,0.15)", color: "white" }}>
+            <Download size={13} /> Download
+          </button>
+          <button onClick={onClose} className="p-1.5 rounded-lg hover:bg-white/10" style={{ color: "white" }}><X size={18} /></button>
+        </div>
+      </div>
+      {/* Content */}
+      <div className="flex-1 overflow-hidden" style={{ background: "#fafaf7" }}>
+        {loading ? (
+          <div className="h-full flex items-center justify-center">
+            <div className="text-sm opacity-50">Loading…</div>
+          </div>
+        ) : content?.html != null ? (
+          // Sandboxed iframe renders the HTML live — full CSS + JS, no download.
+          // allow-scripts makes dynamic pages work; we deliberately omit
+          // allow-same-origin so the doc can't touch the app's storage/cookies.
+          <iframe
+            title={doc.name}
+            srcDoc={content.html}
+            sandbox="allow-scripts allow-popups allow-forms allow-modals"
+            className="w-full h-full"
+            style={{ border: "none", background: "white" }}
+          />
+        ) : content?.url ? (
+          <iframe
+            title={doc.name}
+            src={content.url}
+            className="w-full h-full"
+            style={{ border: "none" }}
+          />
+        ) : (
+          <div className="h-full flex items-center justify-center">
+            <div className="text-sm opacity-50">Could not display this file.</div>
+          </div>
+        )}
+      </div>
+    </div>
+  );
+}
+
 export default function App() {
   const [state, setState]       = useState(DEFAULT_STATE);
   const [hydrated, setHydrated] = useState(false);
@@ -1687,6 +1739,10 @@ export default function App() {
   const [docRenameValue, setDocRenameValue] = useState("");
   const [docDeleteId, setDocDeleteId] = useState(null);
   const [docTagEditId, setDocTagEditId] = useState(null);
+  // In-app document viewer
+  const [viewerDoc, setViewerDoc] = useState(null);       // the doc being viewed
+  const [viewerContent, setViewerContent] = useState(null); // { html } or { url } (pdf)
+  const [viewerLoading, setViewerLoading] = useState(false);
 
   const [compareStocks, setCompareStocks] = useState([]);      // the library (all saved stocks)
   const [compareGroups, setCompareGroups] = useState([]);      // saved named groups
@@ -2647,10 +2703,39 @@ export default function App() {
     await deleteDocument(doc);
   };
 
+  // Open a document inside the app (no download needed).
+  // HTML → rendered live in a sandboxed iframe. PDF → shown in an iframe.
   const openDocument = async (doc) => {
-    const url = await getDocumentUrl(doc);
-    if (url) window.open(url, "_blank", "noopener");
-    else alert("Could not open the file.");
+    setViewerDoc(doc);
+    setViewerContent(null);
+    setViewerLoading(true);
+    try {
+      if (doc.fileType === "html") {
+        const html = await fetchDocumentHtml(doc);
+        if (html == null) { alert("Could not load the file."); setViewerDoc(null); return; }
+        setViewerContent({ html });
+      } else {
+        const url = await documentObjectUrl(doc);
+        if (!url) { alert("Could not load the file."); setViewerDoc(null); return; }
+        setViewerContent({ url });
+      }
+    } finally {
+      setViewerLoading(false);
+    }
+  };
+
+  const closeViewer = () => {
+    // Revoke any object URL we created for a PDF to free memory.
+    if (viewerContent?.url) { try { URL.revokeObjectURL(viewerContent.url); } catch {} }
+    setViewerDoc(null);
+    setViewerContent(null);
+  };
+
+  // Force a real download of the original file.
+  const downloadDocument = async (doc) => {
+    const url = await getDocumentUrl(doc, { download: true });
+    if (url) { const a = document.createElement("a"); a.href = url; a.download = doc.name; a.click(); }
+    else alert("Could not download the file.");
   };
 
   // Derived: all tags across documents, and the filtered/sorted view
@@ -3108,6 +3193,15 @@ export default function App() {
           message="This permanently removes the file and its metadata. This cannot be undone."
           onConfirm={() => doDeleteDocument(docDeleteId)}
           onCancel={() => setDocDeleteId(null)} />
+      )}
+      {viewerDoc && (
+        <DocViewerModal
+          doc={viewerDoc}
+          content={viewerContent}
+          loading={viewerLoading}
+          onClose={closeViewer}
+          onDownload={downloadDocument}
+        />
       )}
       {confirmDelete && (
         <ConfirmModal
@@ -4939,7 +5033,7 @@ export default function App() {
                             <button onClick={() => doToggleStar(doc)} className="p-1.5 rounded hover:bg-gray-100" title={doc.starred ? "Unstar" : "Star"}>
                               <Star size={14} className={doc.starred ? "fill-current" : ""} style={{ color: doc.starred ? "#f59e0b" : "#a3a3a3" }} />
                             </button>
-                            <button onClick={() => openDocument(doc)} className="p-1.5 rounded hover:bg-gray-100" title="Open / download"><Download size={14} style={{ color: "#525252" }} /></button>
+                            <button onClick={() => downloadDocument(doc)} className="p-1.5 rounded hover:bg-gray-100" title="Download"><Download size={14} style={{ color: "#525252" }} /></button>
                             <button onClick={() => { setDocRenameId(doc.id); setDocRenameValue(doc.name); }} className="p-1.5 rounded hover:bg-gray-100" title="Rename"><Pencil size={13} style={{ color: "#525252" }} /></button>
                             <button onClick={() => setDocDeleteId(doc.id)} className="p-1.5 rounded hover:bg-gray-100" title="Delete"><Trash2 size={13} style={{ color: "#dc2626" }} /></button>
                           </div>
